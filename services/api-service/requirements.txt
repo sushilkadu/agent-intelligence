@@ -1,0 +1,8 @@
+# Local shared packages (editable installs, resolved via relative path)
+-e ../../packages/shared-schema
+-e ../../packages/shared-utils
+
+fastapi>=0.110,<0.120
+uvicorn[standard]>=0.29,<0.35
+pytest>=8.0,<9.0
+httpx>=0.27,<0.28

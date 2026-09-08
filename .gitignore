@@ -1,0 +1,34 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+.venv-*/
+venv/
+*.egg
+build/
+dist/
+
+# --- Node / Next.js ---
+# (apps/frontend also has its own create-next-app-generated .gitignore)
+node_modules/
+.next/
+out/
+npm-debug.log*
+.env*.local
+
+# --- Terraform ---
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+.terraform.lock.hcl
+
+# --- Editors / OS ---
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,5 @@
+# Local shared packages (editable installs, resolved via relative path)
+-e ../../packages/shared-schema
+-e ../../packages/shared-utils
+
+pytest>=8.0,<9.0

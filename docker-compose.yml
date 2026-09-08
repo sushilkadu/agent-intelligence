@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: agent-intel-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agent_intel
+      POSTGRES_PASSWORD: agent_intel
+      POSTGRES_DB: agent_intel
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_intel"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  localstack:
+    image: localstack/localstack:latest
+    container_name: agent-intel-localstack
+    restart: unless-stopped
+    environment:
+      SERVICES: s3,sqs,dynamodb
+      DEBUG: "0"
+      PERSISTENCE: "1"
+    ports:
+      - "4566:4566" # LocalStack edge port (S3, SQS, DynamoDB, etc.)
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  postgres_data:
+  localstack_data:
