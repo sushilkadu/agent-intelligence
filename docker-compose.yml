@@ -18,7 +18,13 @@ services:
       retries: 5
 
   localstack:
-    image: localstack/localstack:latest
+    # Pinned to a Community-edition release: the "latest" tag has
+    # moved on to a build that requires a paid LocalStack auth token
+    # and refuses to start without one (verified while wiring up
+    # crawler-service's Phase 1 S3/SQS testing). 3.0.x is the last
+    # tag confirmed to run fully unauthenticated with just
+    # S3/SQS/DynamoDB enabled.
+    image: localstack/localstack:3.0
     container_name: agent-intel-localstack
     restart: unless-stopped
     environment:

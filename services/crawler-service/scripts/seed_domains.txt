@@ -1,0 +1,19 @@
+# Sample seed list for local testing of crawler-service (~15 domains).
+# One domain per line; '#' starts a comment. Real production seeding
+# targets 500-1000 domains -- this scales up with no code change to
+# load_seed_list.py, just a bigger file.
+openai.com
+anthropic.com
+github.com
+cloudflare.com
+stripe.com
+vercel.com
+shopify.com
+huggingface.co
+replit.com
+zapier.com
+notion.so
+mongodb.com
+twilio.com
+salesforce.com
+datadoghq.com
