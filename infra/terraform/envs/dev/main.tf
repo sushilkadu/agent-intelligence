@@ -252,3 +252,226 @@ output "raw_fetched_queue_url" {
 output "crawler_lambda_function_name" {
   value = module.crawler_lambda.function_name
 }
+
+# ---------------------------------------------------------------------------
+# Phase 2: parser-service infrastructure
+# ---------------------------------------------------------------------------
+#
+# parser-service consumes `raw-fetched`, reads the same raw crawl
+# bucket Phase 1 wrote, upserts into a real Postgres database, and
+# publishes `record-changed` to a new `notify-queue` for
+# notifier-service (Phase 5, not built here) to eventually consume.
+#
+# VPC-vs-RDS-Proxy: the build plan explicitly allows either ("use RDS
+# Proxy so Lambda doesn't need to sit in the VPC ... otherwise put it
+# in the VPC if that's simpler"). This env already provisions private
+# subnets + a NAT gateway in Phase 0's network module specifically so
+# resources like this can go in the VPC -- standing up RDS Proxy would
+# be a second piece of infrastructure (with its own IAM auth wiring)
+# purely to avoid using a NAT gateway that already exists and is
+# already being paid for. So: parser Lambda goes directly in the
+# private subnets, no RDS Proxy.
+
+locals {
+  parser_lambda_name = "agent-intel-dev-parser"
+
+  parser_tags = {
+    Environment = "dev"
+    Service     = "parser-service"
+  }
+}
+
+# --- notify-queue ---------------------------------------------------------
+# One message per domain whose normalized record changed from its
+# previous crawl. DLQ enabled for the same reason crawl-queue's is: one
+# permanently-failing notification shouldn't block the queue forever.
+module "notify_queue" {
+  source = "../../modules/sqs"
+
+  name       = "notify-queue"
+  enable_dlq = true
+
+  visibility_timeout_seconds = 60
+
+  tags = local.parser_tags
+}
+
+# --- parser Lambda's security group ----------------------------------------
+# No ingress needed (nothing calls the Lambda directly -- it's
+# triggered by the SQS event source mapping); egress is required to
+# reach Postgres, S3/SQS (via NAT), and Secrets Manager.
+resource "aws_security_group" "parser_lambda" {
+  name_prefix = "${local.parser_lambda_name}-"
+  description = "parser Lambda -- outbound only (Postgres, AWS API calls via NAT)."
+  vpc_id      = module.network.vpc_id
+
+  tags = merge(local.parser_tags, {
+    Name = "${local.parser_lambda_name}-sg"
+  })
+}
+
+resource "aws_security_group_rule" "parser_lambda_egress_all" {
+  type              = "egress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = "-1"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.parser_lambda.id
+  description       = "All outbound -- Postgres (in-VPC), S3/SQS/Secrets Manager (via NAT)."
+}
+
+# --- Aurora Serverless v2 (parser-service's database) -----------------------
+# Scales toward zero ACUs between crawl batches -- see modules/rds/main.tf's
+# docstring for why Serverless v2 over a fixed-size instance.
+module "parser_db" {
+  source = "../../modules/rds"
+
+  name       = "${local.parser_lambda_name}-db"
+  vpc_id     = module.network.vpc_id
+  subnet_ids = module.network.private_subnet_ids
+
+  # Only the parser Lambda's own security group may reach Postgres.
+  allowed_security_group_ids = [aws_security_group.parser_lambda.id]
+
+  min_capacity = 0.5
+  max_capacity = 2
+
+  tags = local.parser_tags
+}
+
+# --- IAM: least-privilege parser Lambda execution role ----------------------
+#
+# Scoped to exactly what parser-service needs: consume raw-fetched,
+# publish to notify-queue, read (only read -- crawler-service already
+# owns writing to it) objects in the raw crawl bucket, read the DB
+# master-user secret Aurora manages, plus the AWS-managed
+# AWSLambdaVPCAccessExecutionRole (ENI create/describe/delete -- the
+# standard permissions any VPC-attached Lambda needs, not specific to
+# this function, hence the managed policy rather than reinventing it
+# inline) and this function's own CloudWatch log group.
+
+data "aws_iam_policy_document" "parser_lambda_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "parser_lambda" {
+  name               = "${local.parser_lambda_name}-role"
+  assume_role_policy = data.aws_iam_policy_document.parser_lambda_assume_role.json
+
+  tags = local.parser_tags
+}
+
+resource "aws_iam_role_policy_attachment" "parser_lambda_vpc_access" {
+  role       = aws_iam_role.parser_lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+data "aws_iam_policy_document" "parser_lambda_permissions" {
+  statement {
+    sid       = "ConsumeRawFetchedQueue"
+    actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+    resources = [module.raw_fetched_queue.queue_arn]
+  }
+
+  statement {
+    sid       = "PublishNotifyQueue"
+    actions   = ["sqs:SendMessage"]
+    resources = [module.notify_queue.queue_arn]
+  }
+
+  statement {
+    sid       = "ReadRawCrawlBucketObjects"
+    actions   = ["s3:GetObject"]
+    resources = ["${module.raw_crawl_bucket.bucket_arn}/*"]
+  }
+
+  statement {
+    sid       = "ReadDbMasterUserSecret"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [module.parser_db.master_user_secret_arn]
+  }
+
+  statement {
+    sid     = "WriteOwnCloudWatchLogs"
+    actions = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = [
+      "arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.parser_lambda_name}:*"
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "parser_lambda" {
+  name   = "${local.parser_lambda_name}-policy"
+  role   = aws_iam_role.parser_lambda.id
+  policy = data.aws_iam_policy_document.parser_lambda_permissions.json
+}
+
+# --- Parser Lambda ----------------------------------------------------------
+
+module "parser_lambda" {
+  source = "../../modules/lambda"
+
+  name        = local.parser_lambda_name
+  description = "Normalizes raw-fetched crawl artifacts (agents.json, the Web Bot Auth JWKS directory) into the canonical `domains` row; publishes record-changed on change."
+  handler     = "parser.handler.lambda_handler"
+  runtime     = "python3.11"
+  timeout     = 60
+  memory_size = 256
+  role_arn    = aws_iam_role.parser_lambda.arn
+
+  # Same caveat as the crawler Lambda's `filename`: this deployment
+  # package doesn't exist yet -- a build/CI step (not part of Phase 2)
+  # produces it. This Terraform is structural, not applied.
+  filename = "${path.module}/../../../../services/parser-service/dist/parser-service.zip"
+
+  vpc_subnet_ids         = module.network.private_subnet_ids
+  vpc_security_group_ids = [aws_security_group.parser_lambda.id]
+
+  environment_variables = {
+    RAW_DATA_BUCKET_NAME = module.raw_crawl_bucket.bucket_id
+    NOTIFY_QUEUE_URL     = module.notify_queue.queue_id
+    AWS_REGION           = var.region
+
+    DB_HOST       = module.parser_db.cluster_endpoint
+    DB_PORT       = tostring(module.parser_db.port)
+    DB_NAME       = module.parser_db.database_name
+    DB_USER       = module.parser_db.master_username
+    DB_SECRET_ARN = module.parser_db.master_user_secret_arn
+    # Deliberately no DB_PASSWORD here -- the password is read from
+    # DB_SECRET_ARN at runtime (see services/parser-service/parser/db.py),
+    # never stored as a plain Lambda environment variable.
+    #
+    # Deliberately no AWS_ENDPOINT_URL -- local-dev-only, see
+    # services/parser-service/parser/config.py.
+  }
+
+  event_source_arn        = module.raw_fetched_queue.queue_arn
+  event_source_batch_size = 10
+
+  depends_on = [aws_iam_role_policy.parser_lambda, aws_iam_role_policy_attachment.parser_lambda_vpc_access]
+
+  tags = local.parser_tags
+}
+
+output "notify_queue_url" {
+  value = module.notify_queue.queue_id
+}
+
+output "parser_db_cluster_endpoint" {
+  value = module.parser_db.cluster_endpoint
+}
+
+output "parser_db_secret_arn" {
+  value = module.parser_db.master_user_secret_arn
+}
+
+output "parser_lambda_function_name" {
+  value = module.parser_lambda.function_name
+}

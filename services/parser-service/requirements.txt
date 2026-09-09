@@ -1,5 +1,16 @@
 # Local shared packages (editable installs, resolved via relative path)
--e ../../packages/shared-schema
+# parser-service both reads shared-schema's Pydantic models AND (unlike
+# most other services) writes to the DB, so it needs the [migrations]
+# extra for psycopg2 -- it does NOT use SQLAlchemy/Alembic at runtime
+# (see parser/db.py's docstring), just the extra's psycopg2 dependency.
+-e ../../packages/shared-schema[migrations]
 -e ../../packages/shared-utils
 
 pytest>=8.0,<9.0
+
+boto3>=1.34,<2.0
+
+# test-only: mock S3/SQS (moto) so tests never touch real AWS. Real
+# Postgres access in tests goes against local docker-compose Postgres
+# directly (see tests/test_db.py), skipped gracefully if unreachable.
+moto[s3,sqs]>=5.0,<6.0

@@ -51,6 +51,18 @@ resource "aws_lambda_function" "this" {
     variables = var.environment_variables
   }
 
+  dynamic "vpc_config" {
+    # Only emit the block when the caller actually wants VPC
+    # placement -- an empty/absent vpc_config is how a Lambda function
+    # stays outside any VPC (the crawler Lambda's case).
+    for_each = var.vpc_subnet_ids != null ? [1] : []
+
+    content {
+      subnet_ids         = var.vpc_subnet_ids
+      security_group_ids = var.vpc_security_group_ids
+    }
+  }
+
   depends_on = [aws_cloudwatch_log_group.this]
 
   tags = merge(local.merged_tags, {

@@ -91,6 +91,26 @@ variable "event_source_enabled" {
   default     = true
 }
 
+# --- Optional VPC placement --------------------------------------------------
+#
+# Added in Phase 2 for parser-service, which needs to reach a
+# VPC-only RDS cluster and (per the network module's design) has no
+# RDS Proxy in front of it -- see envs/dev/main.tf's comment on that
+# tradeoff. Left null/empty by default so existing callers (the
+# crawler Lambda, which needs no VPC access) are unaffected.
+
+variable "vpc_subnet_ids" {
+  description = "Subnet IDs to place this function's ENIs in (typically private subnets). Omit (null) for no VPC attachment. Must be set together with vpc_security_group_ids."
+  type        = list(string)
+  default     = null
+}
+
+variable "vpc_security_group_ids" {
+  description = "Security group IDs to attach to this function's ENIs. Omit (null) for no VPC attachment. Must be set together with vpc_subnet_ids."
+  type        = list(string)
+  default     = null
+}
+
 variable "tags" {
   description = "Common tags applied to all resources."
   type        = map(string)

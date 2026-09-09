@@ -7,6 +7,21 @@ dependencies = [
     "pydantic>=2.6,<3.0",
 ]
 
+# Phase 2: the SQLAlchemy Core table metadata (tables.py) + Alembic
+# migrations live here too, since this package is "the canonical schema
+# only lives in one place" (see repo layout notes). Kept as an optional
+# extra rather than a hard dependency: most consumers of shared-schema
+# (api-service, billing-service, etc.) only need the Pydantic models,
+# not a DB driver. Only parser-service (which runs migrations and does
+# the runtime upsert) and anyone running `alembic upgrade head` needs
+# to install shared-schema[migrations].
+[project.optional-dependencies]
+migrations = [
+    "sqlalchemy>=2.0,<3.0",
+    "alembic>=1.13,<2.0",
+    "psycopg2-binary>=2.9,<3.0",
+]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
