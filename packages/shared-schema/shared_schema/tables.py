@@ -113,6 +113,14 @@ monitors = Table(
     Column("monitor_id", UUID(as_uuid=True), primary_key=True),
     Column("domain", String, ForeignKey("domains.domain"), nullable=False),
     Column("webhook_url", String, nullable=False),
+    # Phase 5 addition -- see alembic/versions/<rev>_monitor_ownership.py
+    # and models.py's `Monitor.owner_key_id` docstring for the full
+    # rationale: closes a real ownership gap (anyone could register or
+    # delete anyone else's monitor) in this previously-committed table.
+    # NOT NULL: every monitor is created through `POST /v1/monitors`,
+    # which requires an authenticated paid-tier key -- there is no path
+    # that creates an ownerless monitor.
+    Column("owner_key_id", String, ForeignKey("api_keys.key_id"), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
 )
 

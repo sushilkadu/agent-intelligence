@@ -66,11 +66,12 @@ app = FastAPI(title="Agent Intelligence API Service")
 #
 # `allow_methods` adds POST for `POST /v1/domains/bulk`; `allow_headers`
 # was already `"*"`, which covers the new `X-API-Key` header without a
-# change.
+# change. Phase 5 adds DELETE for `DELETE /v1/monitors/{id}` -- same
+# bearer-token reasoning as above, unchanged by adding one more method.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 

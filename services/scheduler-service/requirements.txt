@@ -1,5 +1,14 @@
 # Local shared packages (editable installs, resolved via relative path)
--e ../../packages/shared-schema
+# scheduler-service reads `domains`/`monitors`/`api_keys` via psycopg2,
+# hence the [migrations] extra -- same reasoning as api-service's/
+# parser-service's requirements.txt, scheduler-service just never runs
+# Alembic itself.
+-e ../../packages/shared-schema[migrations]
 -e ../../packages/shared-utils
 
 pytest>=8.0,<9.0
+
+boto3>=1.34,<2.0
+
+# test-only: mock SQS (moto) so tests never touch real AWS.
+moto[sqs]>=5.0,<6.0

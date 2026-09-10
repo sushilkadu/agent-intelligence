@@ -27,6 +27,10 @@ def build_raw_fetched_message(
     web_bot_auth_present: bool,
     web_bot_auth_status_code: int | None,
     web_bot_auth_s3_key: str,
+    llms_txt_present: bool = False,
+    llms_txt_status_code: int | None = None,
+    llms_txt_s3_key: str | None = None,
+    on_chain_ref: str | None = None,
 ) -> dict:
     """Build the `raw-fetched` message payload.
 
@@ -34,6 +38,14 @@ def build_raw_fetched_message(
     codes for each signal), and the S3 keys written for each -- enough
     for parser-service to go fetch the raw artifacts and normalize
     them, without re-deriving anything crawler-service already knows.
+
+    `llms_txt_*` (Phase 5) mirrors `agents_json`'s shape exactly --
+    `llms_txt_s3_key` is None (not written to S3 at all) when
+    `CRAWL_LLMS_TXT_ENABLED` is false, since no fetch was attempted.
+    `on_chain_ref` (Phase 5) is a bare passthrough of whatever
+    `onchain.lookup_on_chain_ref` returned (always None today -- see
+    that module's docstring), not an artifact fetch, so it has no
+    accompanying S3 key.
     """
     return {
         "domain": domain,
@@ -48,6 +60,12 @@ def build_raw_fetched_message(
             "status_code": web_bot_auth_status_code,
             "s3_key": web_bot_auth_s3_key,
         },
+        "llms_txt": {
+            "present": llms_txt_present,
+            "status_code": llms_txt_status_code,
+            "s3_key": llms_txt_s3_key,
+        },
+        "on_chain_ref": on_chain_ref,
     }
 
 

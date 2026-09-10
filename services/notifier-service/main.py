@@ -1,10 +1,12 @@
 """notifier-service: fires webhook notifications to monitors when a
 watched domain's agent-identity signals change.
 
-Phase 0: no notification logic yet -- this will eventually be
-Lambda-triggered (e.g. off an SQS queue of domain-change events). For now
-it just proves the service is wired up: importable shared-schema/
-shared-utils, and a health_check() entrypoint.
+Phase 0 shipped this as a health-check-only stub. Phase 5 adds the real
+logic in the `notifier/` package -- see `notifier/handler.py` for the
+actual Lambda entrypoint (`notifier.handler.lambda_handler`, SQS-triggered
+off `notify-queue`), which Terraform points at (see
+infra/terraform/envs/dev/main.tf's `notifier_lambda`). This module is
+kept as-is for the health_check() proof-of-wiring entrypoint.
 """
 
 from shared_schema import Monitor  # noqa: F401  (proves shared-schema wiring works)

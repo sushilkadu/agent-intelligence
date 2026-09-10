@@ -110,9 +110,24 @@ class ApiKey(BaseModel):
 
 
 class Monitor(BaseModel):
-    """A subscription to be notified (via webhook) of changes to a domain."""
+    """A subscription to be notified (via webhook) of changes to a domain.
+
+    Phase 5 note: `owner_key_id` was added to close a real gap in this
+    model as originally committed (Phase 0) -- without an owner, ANY
+    caller (or any API key at all) could register a webhook monitor for
+    ANY domain, and later delete ANYONE's monitor by guessing/enumerating
+    `monitor_id`. See `api/routes.py`'s monitor endpoints and the new
+    Alembic migration's docstring for the full rationale. Every monitor
+    now belongs to exactly one `api_keys` row (the key that registered
+    it); `POST /v1/monitors` only accepts paid-tier keys (monitoring is
+    a paid feature) and `DELETE /v1/monitors/{id}` only succeeds for the
+    owning key.
+    """
 
     monitor_id: UUID = Field(..., description="Primary key")
     domain: str = Field(..., description="FK reference to domains.domain")
     webhook_url: str
+    owner_key_id: str = Field(
+        ..., description="FK reference to api_keys.key_id -- the paid-tier key that registered this monitor."
+    )
     created_at: datetime

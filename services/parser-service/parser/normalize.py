@@ -58,6 +58,9 @@ def build_domain_record(
     confidence_flags: list[str],
     previous: dict[str, Any] | None,
     now: datetime,
+    llms_txt_present: bool = False,
+    llms_txt_s3_key: str | None = None,
+    on_chain_ref: str | None = None,
 ) -> dict[str, Any]:
     """Build the full normalized record for one domain's crawl.
 
@@ -66,10 +69,15 @@ def build_domain_record(
     `first_seen_at`/`created_at` across crawls; every other field is
     always recomputed fresh from this crawl's inputs.
 
-    Phase 1 (crawler-service) doesn't fetch llms.txt or an on-chain
-    registry ref yet, so those fields are always their Pydantic-model
-    defaults here (False/None) -- not this module inventing data for
-    signals nothing upstream produces yet.
+    `llms_txt_present`/`llms_txt_s3_key` (Phase 5) and `on_chain_ref`
+    (Phase 5, still always None in practice -- see crawler-service's
+    `crawler/onchain.py`) are plain passthroughs of whatever
+    crawler-service's raw-fetched message reported; this module doesn't
+    re-derive or validate them (llms.txt has no fixed structure to
+    validate against, unlike agents.json's manifest/Web Bot Auth's JWKS).
+    Both default to their "signal absent" values so callers that don't
+    pass them (e.g. any test fixture predating Phase 5) keep working
+    unchanged.
     """
     first_seen_at = previous["first_seen_at"] if previous else crawled_at
     created_at = previous["created_at"] if previous else now
@@ -80,15 +88,15 @@ def build_domain_record(
         "last_crawled_at": crawled_at,
         "agent_json_present": agents_json_present,
         "agent_json_s3_key": agents_json_s3_key,
-        "llms_txt_present": False,
-        "llms_txt_s3_key": None,
+        "llms_txt_present": llms_txt_present,
+        "llms_txt_s3_key": llms_txt_s3_key,
         "web_bot_auth_present": web_bot_auth_present,
         "web_bot_auth_key_id": webbotauth.key_id,
         "web_bot_auth_valid": webbotauth.valid,
         "web_bot_auth_expiry": webbotauth.expiry,
         "declared_capabilities": manifest.declared_capabilities,
         "confidence_flags": confidence_flags,
-        "on_chain_ref": None,
+        "on_chain_ref": on_chain_ref,
         "created_at": created_at,
         "updated_at": now,
     }

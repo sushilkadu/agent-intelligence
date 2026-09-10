@@ -95,11 +95,20 @@ def process_message(
 
     agents_info = message.get("agents_json") or {}
     web_bot_auth_info = message.get("web_bot_auth") or {}
+    # Phase 5: llms_txt/on_chain_ref are absent from a raw-fetched
+    # message published by a pre-Phase-5 crawler-service (or one with
+    # CRAWL_LLMS_TXT_ENABLED off) -- `.get(...)` with these defaults
+    # means such a message still parses cleanly as "signal absent"
+    # rather than a KeyError.
+    llms_txt_info = message.get("llms_txt") or {}
 
     agents_json_present = bool(agents_info.get("present"))
     agents_json_s3_key = agents_info.get("s3_key")
     web_bot_auth_present = bool(web_bot_auth_info.get("present"))
     web_bot_auth_s3_key = web_bot_auth_info.get("s3_key")
+    llms_txt_present = bool(llms_txt_info.get("present"))
+    llms_txt_s3_key = llms_txt_info.get("s3_key")
+    on_chain_ref = message.get("on_chain_ref")
 
     manifest = ParsedManifest()
     if agents_json_present and agents_json_s3_key:
@@ -133,6 +142,9 @@ def process_message(
         confidence_flags=flags,
         previous=previous,
         now=now,
+        llms_txt_present=llms_txt_present,
+        llms_txt_s3_key=llms_txt_s3_key,
+        on_chain_ref=on_chain_ref,
     )
 
     changed_fields = diff_records(previous, record)

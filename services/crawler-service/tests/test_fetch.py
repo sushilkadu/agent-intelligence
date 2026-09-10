@@ -7,17 +7,19 @@ import asyncio
 import httpx
 import respx
 
-from crawler.config import AGENTS_JSON_PATH, WEB_BOT_AUTH_WELL_KNOWN_PATH
+from crawler.config import AGENTS_JSON_PATH, LLMS_TXT_PATH, WEB_BOT_AUTH_WELL_KNOWN_PATH
 from crawler.fetch import (
     build_url,
     crawl_domain,
     fetch_agents_json,
+    fetch_llms_txt,
     fetch_web_bot_auth_directory,
 )
 
 DOMAIN = "example.com"
 AGENTS_JSON_URL = build_url(DOMAIN, AGENTS_JSON_PATH)
 WEB_BOT_AUTH_URL = build_url(DOMAIN, WEB_BOT_AUTH_WELL_KNOWN_PATH)
+LLMS_TXT_URL = build_url(DOMAIN, LLMS_TXT_PATH)
 
 
 def run(coro):
@@ -177,25 +179,79 @@ def test_web_bot_auth_timeout():
     assert result.error is not None
 
 
+# --- llms.txt ---------------------------------------------------------
+
+
+@respx.mock
+def test_llms_txt_present_valid_text():
+    respx.get(LLMS_TXT_URL).mock(return_value=httpx.Response(200, content=b"# example.com\n\nA demo site.\n"))
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            return await fetch_llms_txt(client, DOMAIN)
+
+    result = run(go())
+
+    assert result.present is True
+    assert result.status_code == 200
+    assert result.error is None
+    assert b"example.com" in result.body
+
+
+@respx.mock
+def test_llms_txt_missing_404():
+    respx.get(LLMS_TXT_URL).mock(return_value=httpx.Response(404))
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            return await fetch_llms_txt(client, DOMAIN)
+
+    result = run(go())
+
+    assert result.present is False
+    assert result.status_code == 404
+    assert result.error is None
+
+
+@respx.mock
+def test_llms_txt_timeout():
+    respx.get(LLMS_TXT_URL).mock(side_effect=httpx.TimeoutException("timed out"))
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            return await fetch_llms_txt(client, DOMAIN)
+
+    result = run(go())
+
+    assert result.present is False
+    assert result.error is not None
+    assert "timeout" in result.error
+
+
 # --- combined crawl_domain -------------------------------------------------
 
 
 @respx.mock
-def test_crawl_domain_fetches_both_signals():
+def test_crawl_domain_fetches_all_signals_when_llms_txt_enabled():
     respx.get(AGENTS_JSON_URL).mock(return_value=httpx.Response(200, json={"agents": []}))
     respx.get(WEB_BOT_AUTH_URL).mock(return_value=httpx.Response(404))
+    respx.get(LLMS_TXT_URL).mock(return_value=httpx.Response(200, content=b"# example.com\n"))
 
     result = run(crawl_domain(DOMAIN))
 
     assert result.domain == DOMAIN
     assert result.agents_json.present is True
     assert result.web_bot_auth.present is False
+    assert result.llms_txt.present is True
+    # No chain/contract/RPC endpoint specified anywhere -- always None.
+    assert result.on_chain_ref is None
 
 
 @respx.mock
-def test_crawl_domain_unreachable_for_both_signals():
+def test_crawl_domain_unreachable_for_all_signals():
     respx.get(AGENTS_JSON_URL).mock(side_effect=httpx.ConnectError("no route to host"))
     respx.get(WEB_BOT_AUTH_URL).mock(side_effect=httpx.ConnectError("no route to host"))
+    respx.get(LLMS_TXT_URL).mock(side_effect=httpx.ConnectError("no route to host"))
 
     result = run(crawl_domain(DOMAIN))
 
@@ -203,3 +259,22 @@ def test_crawl_domain_unreachable_for_both_signals():
     assert result.agents_json.error is not None
     assert result.web_bot_auth.present is False
     assert result.web_bot_auth.error is not None
+    assert result.llms_txt.present is False
+    assert result.llms_txt.error is not None
+
+
+@respx.mock
+def test_crawl_domain_skips_llms_txt_fetch_when_disabled(monkeypatch):
+    import crawler.fetch as fetch_module
+
+    monkeypatch.setattr(fetch_module, "CRAWL_LLMS_TXT_ENABLED", False)
+    respx.get(AGENTS_JSON_URL).mock(return_value=httpx.Response(200, json={"agents": []}))
+    respx.get(WEB_BOT_AUTH_URL).mock(return_value=httpx.Response(404))
+    # Deliberately NOT mocking LLMS_TXT_URL -- if crawl_domain fetched it
+    # anyway despite the flag being off, respx would raise for the
+    # unmocked request and this test would fail for that reason.
+
+    result = run(crawl_domain(DOMAIN))
+
+    assert result.llms_txt.present is False
+    assert result.llms_txt.error is None  # never attempted, not a real network failure

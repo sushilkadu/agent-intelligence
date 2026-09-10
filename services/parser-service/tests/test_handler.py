@@ -342,6 +342,39 @@ def test_lambda_handler_with_no_records_is_a_noop(monkeypatch):
     assert result == {"processed": 0, "domains": []}
 
 
+@mock_aws
+def test_llms_txt_and_on_chain_ref_passed_through_from_raw_fetched_message(monkeypatch):
+    """Phase 5: crawler-service's raw-fetched message may carry
+    `llms_txt`/`on_chain_ref` -- parser-service must pass both straight
+    through into the normalized record (see normalize.py), not drop or
+    reinterpret them.
+    """
+    s3_client, _sqs_client, _queue_url, store = _setup(monkeypatch)
+    _put_envelope(s3_client, "withllms.example/2026-09-09T12:00:00+00:00/llms.txt", b"# withllms.example\n")
+
+    message = {
+        "domain": "withllms.example",
+        "crawled_at": NOW.isoformat(),
+        "agents_json": {"present": False, "status_code": 404, "s3_key": None},
+        "web_bot_auth": {"present": False, "status_code": 404, "s3_key": None},
+        "llms_txt": {
+            "present": True,
+            "status_code": 200,
+            "s3_key": "withllms.example/2026-09-09T12:00:00+00:00/llms.txt",
+        },
+        "on_chain_ref": "chain:stub:not-a-real-lookup",
+    }
+    event = {"Records": [{"body": json.dumps(message)}]}
+
+    result = handler.lambda_handler(event, None, now=NOW)
+
+    assert result == {"processed": 1, "domains": ["withllms.example"]}
+    record = store.rows["withllms.example"]
+    assert record["llms_txt_present"] is True
+    assert record["llms_txt_s3_key"] == "withllms.example/2026-09-09T12:00:00+00:00/llms.txt"
+    assert record["on_chain_ref"] == "chain:stub:not-a-real-lookup"
+
+
 def test_extract_message_from_valid_body():
     record = {"body": json.dumps({"domain": "example.com", "crawled_at": "x"})}
     message = handler.extract_message(record)

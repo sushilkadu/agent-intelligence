@@ -14,7 +14,7 @@ import respx
 from moto import mock_aws
 
 from crawler import handler
-from crawler.config import AGENTS_JSON_PATH, WEB_BOT_AUTH_WELL_KNOWN_PATH
+from crawler.config import AGENTS_JSON_PATH, LLMS_TXT_PATH, WEB_BOT_AUTH_WELL_KNOWN_PATH
 from crawler.fetch import build_url
 from crawler.handler import extract_domain, lambda_handler
 
@@ -65,18 +65,24 @@ def test_lambda_handler_end_to_end(monkeypatch):
     respx.get(build_url(domain_b, WEB_BOT_AUTH_WELL_KNOWN_PATH)).mock(
         side_effect=httpx.ConnectError("no route to host")
     )
+    # CRAWL_LLMS_TXT_ENABLED defaults to true, so crawl_domain fetches
+    # this too -- mock it for both domains like the other two signals.
+    respx.get(build_url(domain_a, LLMS_TXT_PATH)).mock(return_value=httpx.Response(200, content=b"# demo\n"))
+    respx.get(build_url(domain_b, LLMS_TXT_PATH)).mock(return_value=httpx.Response(404))
 
     result = lambda_handler(_sqs_event([domain_a, domain_b]), None)
 
     assert result == {"processed": 2, "domains": [domain_a, domain_b]}
 
-    # Both domains wrote both artifacts to S3.
+    # Both domains wrote all three artifacts to S3.
     keys = {obj["Key"] for obj in s3_client.list_objects_v2(Bucket=BUCKET)["Contents"]}
-    assert len(keys) == 4
+    assert len(keys) == 6
     assert any(k.startswith(domain_a) and k.endswith("agents.json") for k in keys)
     assert any(k.startswith(domain_a) and k.endswith("web-bot-auth-directory") for k in keys)
+    assert any(k.startswith(domain_a) and k.endswith("llms.txt") for k in keys)
     assert any(k.startswith(domain_b) and k.endswith("agents.json") for k in keys)
     assert any(k.startswith(domain_b) and k.endswith("web-bot-auth-directory") for k in keys)
+    assert any(k.startswith(domain_b) and k.endswith("llms.txt") for k in keys)
 
     # One raw-fetched message per domain, with the right presence flags.
     received = sqs_client.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
@@ -84,10 +90,13 @@ def test_lambda_handler_end_to_end(monkeypatch):
     assert set(bodies) == {domain_a, domain_b}
     assert bodies[domain_a]["agents_json"]["present"] is True
     assert bodies[domain_a]["web_bot_auth"]["present"] is True
+    assert bodies[domain_a]["llms_txt"]["present"] is True
+    assert bodies[domain_a]["on_chain_ref"] is None
     assert bodies[domain_b]["agents_json"]["present"] is False
     assert bodies[domain_b]["agents_json"]["status_code"] == 404
     assert bodies[domain_b]["web_bot_auth"]["present"] is False
     assert bodies[domain_b]["web_bot_auth"]["status_code"] is None
+    assert bodies[domain_b]["llms_txt"]["present"] is False
 
 
 @mock_aws

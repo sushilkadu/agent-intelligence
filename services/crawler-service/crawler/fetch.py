@@ -17,10 +17,13 @@ import httpx
 
 from .config import (
     AGENTS_JSON_PATH,
+    CRAWL_LLMS_TXT_ENABLED,
     DEFAULT_TIMEOUT_SECONDS,
+    LLMS_TXT_PATH,
     URL_SCHEME,
     WEB_BOT_AUTH_WELL_KNOWN_PATH,
 )
+from .onchain import lookup_on_chain_ref
 
 
 @dataclass
@@ -46,11 +49,20 @@ class FetchResult:
 
 @dataclass
 class CrawlResult:
-    """Both signals fetched for one domain."""
+    """Every signal fetched/looked-up for one domain.
+
+    `llms_txt` is a real `FetchResult` only when `CRAWL_LLMS_TXT_ENABLED`
+    is true (see config.py); disabled, it's a not-present placeholder
+    with no network call made -- mirrors how `on_chain_ref` is always
+    present on the result but only ever non-None once a real on-chain
+    backend exists (see onchain.py).
+    """
 
     domain: str
     agents_json: FetchResult
     web_bot_auth: FetchResult
+    llms_txt: FetchResult
+    on_chain_ref: str | None = None
 
 
 def build_url(domain: str, path: str) -> str:
@@ -101,19 +113,53 @@ async def fetch_web_bot_auth_directory(client: httpx.AsyncClient, domain: str) -
     return await fetch_url(client, build_url(domain, WEB_BOT_AUTH_WELL_KNOWN_PATH))
 
 
+async def fetch_llms_txt(client: httpx.AsyncClient, domain: str) -> FetchResult:
+    """Fetch `domain`'s llms.txt, mirroring `fetch_agents_json` exactly
+    (same well-known-path-fetch pattern, same "absent is normal, never
+    raises" semantics). Only called when `CRAWL_LLMS_TXT_ENABLED` is
+    true -- see `crawl_domain`.
+    """
+    return await fetch_url(client, build_url(domain, LLMS_TXT_PATH))
+
+
+def _not_fetched_result(url: str) -> FetchResult:
+    """A `FetchResult` placeholder for a signal this crawl deliberately
+    did not attempt (llms.txt fetching disabled via feature flag) --
+    distinct from a real fetch that came back absent (404/timeout/etc.,
+    which also has `present=False` but a populated `fetched_at`/`error`).
+    """
+    return FetchResult(url=url, fetched_at=datetime.now(timezone.utc).isoformat(), present=False)
+
+
 async def crawl_domain(domain: str, client: httpx.AsyncClient | None = None) -> CrawlResult:
-    """Fetch both signals for `domain`.
+    """Fetch every signal for `domain`: agents.json and the Web Bot Auth
+    JWKS directory always; llms.txt only when `CRAWL_LLMS_TXT_ENABLED`
+    is true; the on-chain registry ref via `onchain.lookup_on_chain_ref`
+    (itself feature-flagged and, today, always `None` -- see
+    onchain.py's docstring).
 
     Pass an existing `client` to reuse connection pooling across many
     domains in one crawl batch (the Lambda handler does this); omit it
     for one-off/manual use, which opens and closes a client for you.
     """
+    async def _run(active_client: httpx.AsyncClient) -> CrawlResult:
+        agents_json = await fetch_agents_json(active_client, domain)
+        web_bot_auth = await fetch_web_bot_auth_directory(active_client, domain)
+        llms_txt = (
+            await fetch_llms_txt(active_client, domain)
+            if CRAWL_LLMS_TXT_ENABLED
+            else _not_fetched_result(build_url(domain, LLMS_TXT_PATH))
+        )
+        return CrawlResult(
+            domain=domain,
+            agents_json=agents_json,
+            web_bot_auth=web_bot_auth,
+            llms_txt=llms_txt,
+            on_chain_ref=lookup_on_chain_ref(domain),
+        )
+
     if client is not None:
-        agents_json = await fetch_agents_json(client, domain)
-        web_bot_auth = await fetch_web_bot_auth_directory(client, domain)
-        return CrawlResult(domain=domain, agents_json=agents_json, web_bot_auth=web_bot_auth)
+        return await _run(client)
 
     async with httpx.AsyncClient(follow_redirects=True) as new_client:
-        agents_json = await fetch_agents_json(new_client, domain)
-        web_bot_auth = await fetch_web_bot_auth_directory(new_client, domain)
-        return CrawlResult(domain=domain, agents_json=agents_json, web_bot_auth=web_bot_auth)
+        return await _run(new_client)

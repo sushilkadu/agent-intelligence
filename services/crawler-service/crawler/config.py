@@ -28,6 +28,30 @@ WEB_BOT_AUTH_WELL_KNOWN_PATH = "/.well-known/http-message-signatures-directory"
 
 AGENTS_JSON_PATH = "/agents.json"
 
+# llms.txt -- an emerging community convention (no single formal spec,
+# unlike the Web Bot Auth IETF drafts above) for a plain-text file
+# describing a site for LLM consumption. Fetched the exact same way as
+# agents.json (see fetch.py's `fetch_llms_txt`) -- Phase 5 adds this as
+# a third well-known signal, independently feature-flagged (see
+# CRAWL_LLMS_TXT_ENABLED below) since it's a separate, still-informal
+# convention from the other two.
+LLMS_TXT_PATH = "/llms.txt"
+
+# --- Feature flags (Phase 5) --------------------------------------------------
+#
+# Both default differently on purpose:
+#   * llms.txt fetching is a straightforward, low-risk mirror of the
+#     existing agents.json fetch (same code path, same failure
+#     handling) -- on by default.
+#   * The on-chain registry check (see onchain.py) is a documented
+#     STUB: the build plan never named a chain, contract, or registry
+#     protocol to integrate with, so there is nothing real for this
+#     flag to turn on yet. Defaults to false so enabling it (once a
+#     real spec exists) is an explicit, deliberate opt-in rather than
+#     something that silently starts running.
+CRAWL_LLMS_TXT_ENABLED = os.environ.get("CRAWL_LLMS_TXT_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+CRAWL_ON_CHAIN_ENABLED = os.environ.get("CRAWL_ON_CHAIN_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
 # --- HTTP fetch behavior ------------------------------------------------------
 
 DEFAULT_TIMEOUT_SECONDS = float(os.environ.get("CRAWLER_TIMEOUT_SECONDS", "10"))

@@ -15,20 +15,36 @@ that always require a valid API key (see their own dependencies below).
 
 from __future__ import annotations
 
+import uuid
+from datetime import datetime, timezone
+
+import psycopg2
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from shared_utils import UnsafeWebhookURLError, validate_webhook_url
 
 from .auth import ApiKeyContext, authenticate, lookup_api_key_context
 from .config import (
     API_KEY_HEADER,
     BULK_ALLOWED_PLAN_TIERS,
+    EXPORT_ALLOWED_PLAN_TIERS,
     HISTORY_DEFAULT_LIMIT,
     HISTORY_MAX_LIMIT,
+    MONITOR_ALLOWED_PLAN_TIERS,
     RATE_LIMIT_PER_MINUTE,
     RATE_LIMIT_TABLE_NAME,
     RATE_LIMIT_WINDOW_SECONDS,
     RAW_DATA_BUCKET_NAME,
 )
-from .db import fetch_domain, fetch_domains_bulk, get_connection
+from .db import (
+    delete_monitor,
+    fetch_all_domains,
+    fetch_domain,
+    fetch_domains_bulk,
+    fetch_monitor,
+    get_connection,
+    insert_monitor,
+)
+from .export import get_export_s3_client, run_export
 from .history import get_s3_client, list_domain_history
 from .ratelimit import (
     build_rate_limited_error,
@@ -42,7 +58,10 @@ from .schemas import (
     BulkDomainsRequest,
     BulkDomainsResponse,
     DomainHistoryResponse,
+    ExportResponse,
     KeyUsageResponse,
+    MonitorCreateRequest,
+    MonitorResponse,
 )
 
 router = APIRouter()
@@ -273,6 +292,203 @@ def bulk_domains(
         for domain in payload.domains
     ]
     return BulkDomainsResponse(count=len(results), results=results)
+
+
+def require_monitor_api_key(request: Request, conn=Depends(_get_db_connection)) -> ApiKeyContext:  # noqa: B008 (standard FastAPI DI idiom)
+    """FastAPI dependency for `POST /v1/monitors`: monitoring is a paid
+    feature, gated the exact same way `POST /v1/domains/bulk` is (see
+    `require_bulk_api_key`'s docstring for the full 403-for-everything
+    rationale) -- "no key", "unrecognized key", and "valid free-tier
+    key" all collapse to one clean 403, never a 401/500.
+    """
+    header_value = request.headers.get(API_KEY_HEADER)
+    context = lookup_api_key_context(conn, header_value)
+    if context is None or context.plan_tier not in MONITOR_ALLOWED_PLAN_TIERS:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "forbidden",
+                "message": (
+                    "POST /v1/monitors requires an active API key on the self_serve or licensing plan. "
+                    "See POST /v1/billing/checkout (billing-service) to subscribe."
+                ),
+            },
+        )
+    return context
+
+
+def enforce_monitor_rate_limit(context: ApiKeyContext = Depends(require_monitor_api_key)) -> None:  # noqa: B008 (standard FastAPI DI idiom)
+    """Rate-limits monitor registration using the same key-based scheme
+    as the bulk endpoint's `enforce_bulk_rate_limit` -- see that
+    function's docstring.
+    """
+    dynamodb_client = get_dynamodb_client()
+    allowed, _count = check_and_increment_for_key(
+        dynamodb_client,
+        RATE_LIMIT_TABLE_NAME,
+        context.key_id,
+        limit=context.rate_limit,
+        window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=build_rate_limited_error(
+                limit=context.rate_limit, window_seconds=RATE_LIMIT_WINDOW_SECONDS, tier=context.plan_tier
+            ),
+        )
+
+
+def require_export_api_key(request: Request, conn=Depends(_get_db_connection)) -> ApiKeyContext:  # noqa: B008 (standard FastAPI DI idiom)
+    """FastAPI dependency for `POST /v1/export`: a full-table dump is
+    gated more strictly than bulk lookup/monitoring -- `licensing` tier
+    only (see `EXPORT_ALLOWED_PLAN_TIERS`), same 403-for-everything
+    shape as the other paid-tier dependencies above.
+    """
+    header_value = request.headers.get(API_KEY_HEADER)
+    context = lookup_api_key_context(conn, header_value)
+    if context is None or context.plan_tier not in EXPORT_ALLOWED_PLAN_TIERS:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "forbidden",
+                "message": "POST /v1/export requires an active API key on the licensing plan.",
+            },
+        )
+    return context
+
+
+@router.post(
+    "/v1/monitors",
+    summary="Register a webhook to be notified when a domain's agent-identity signals change",
+    response_model=MonitorResponse,
+    status_code=201,
+    dependencies=[Depends(enforce_monitor_rate_limit)],
+)
+def create_monitor(
+    payload: MonitorCreateRequest,
+    context: ApiKeyContext = Depends(require_monitor_api_key),  # noqa: B008 (standard FastAPI DI idiom)
+    conn=Depends(_get_db_connection),  # noqa: B008 (standard FastAPI DI idiom)
+) -> MonitorResponse:
+    """Create a monitor owned by the calling key.
+
+    `webhook_url` is validated for SSRF safety BEFORE anything is
+    persisted (see `shared_utils.webhook_safety.validate_webhook_url`'s
+    docstring for exactly what "safe" means here and its documented
+    DNS-rebinding residual risk) -- an unsafe URL is a clean 400, never
+    a 500 and never a row that gets created anyway. This is
+    defense-in-depth's FIRST layer; notifier-service re-validates the
+    same URL again immediately before every delivery attempt (see
+    `services/notifier-service/notifier/webhook.py`), since a URL safe
+    at registration time is not guaranteed to still be safe at some
+    future delivery time.
+    """
+    try:
+        validate_webhook_url(payload.webhook_url)
+    except UnsafeWebhookURLError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "unsafe_webhook_url", "message": str(exc)},
+        ) from exc
+
+    monitor_id = uuid.uuid4()
+    created_at = datetime.now(timezone.utc)
+
+    try:
+        row = insert_monitor(
+            conn,
+            monitor_id=monitor_id,
+            domain=payload.domain,
+            webhook_url=payload.webhook_url,
+            owner_key_id=context.key_id,
+            created_at=created_at,
+        )
+    except psycopg2.IntegrityError as exc:
+        # Almost certainly the `domain` FK constraint (monitors.domain
+        # references domains.domain) -- registering a monitor for a
+        # domain this service has never crawled. A clean 400, not a
+        # 500: the caller sent a domain name this system doesn't
+        # recognize, not something that broke.
+        conn.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "unknown_domain",
+                "message": f"'{payload.domain}' has not been crawled yet -- cannot register a monitor for it.",
+            },
+        ) from exc
+
+    return MonitorResponse(
+        monitor_id=str(row["monitor_id"]),
+        domain=row["domain"],
+        webhook_url=row["webhook_url"],
+        owner_key_id=row["owner_key_id"],
+        created_at=row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
+    )
+
+
+@router.delete(
+    "/v1/monitors/{monitor_id}",
+    summary="Delete a monitor you own",
+    status_code=204,
+)
+def delete_monitor_route(
+    monitor_id: str,
+    context: ApiKeyContext = Depends(require_any_api_key),  # noqa: B008 (standard FastAPI DI idiom)
+    conn=Depends(_get_db_connection),  # noqa: B008 (standard FastAPI DI idiom)
+) -> None:
+    """Delete `monitor_id` if (and only if) it's owned by the calling
+    key.
+
+    Returns 404 -- never a 403 -- for BOTH "no such monitor" AND "this
+    monitor exists but belongs to a different key." Distinguishing
+    those with a 403-vs-404 split would let a caller enumerate other
+    customers' monitor ids by observing which status code comes back
+    for a guessed id (403 confirms existence, 404 denies it); collapsing
+    both to 404 makes that enumeration attack unobservable, at the
+    standard cost of "not found" also technically describing "found,
+    but not yours."
+    """
+    try:
+        parsed_id = uuid.UUID(monitor_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "monitor_not_found", "message": f"'{monitor_id}' is not a valid monitor id."},
+        ) from None
+
+    row = fetch_monitor(conn, parsed_id)
+    if row is None or row["owner_key_id"] != context.key_id:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "monitor_not_found", "message": f"No monitor '{monitor_id}' found for this API key."},
+        )
+
+    delete_monitor(conn, parsed_id)
+    return None
+
+
+@router.post(
+    "/v1/export",
+    summary="Export the full domains table as NDJSON, licensing tier only",
+    response_model=ExportResponse,
+)
+def export_domains(
+    context: ApiKeyContext = Depends(require_export_api_key),  # noqa: B008 (standard FastAPI DI idiom)
+    conn=Depends(_get_db_connection),  # noqa: B008 (standard FastAPI DI idiom)
+) -> ExportResponse:
+    """Dump every `domains` row to S3 as newline-delimited JSON and
+    return a short-lived presigned GET URL for it (see api/export.py's
+    module docstring for the full rationale, including why this runs
+    synchronously in-request at THIS phase's scale and what changes
+    before real production traffic: this needs to become an async,
+    SQS-triggered export worker once the dataset is large enough that a
+    synchronous dump risks the Lambda/API-Gateway request timeout).
+    """
+    rows = fetch_all_domains(conn)
+    s3_client = get_export_s3_client()
+    result = run_export(s3_client, rows, key_id=context.key_id)
+    return ExportResponse(**result)
 
 
 @router.get(

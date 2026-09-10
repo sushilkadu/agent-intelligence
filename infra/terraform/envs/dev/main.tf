@@ -338,11 +338,20 @@ module "parser_db" {
   # Lambda (Phase 4, declared further below) is added the same way --
   # it's the one service that WRITES to `api_keys` (issuance + Stripe
   # lifecycle), reusing this same cluster rather than standing up a
-  # second database for one more table.
+  # second database for one more table. notifier-service's and
+  # scheduler-service's Lambdas (Phase 5, declared further below) are
+  # added for the same reuse-not-duplicate reason -- both are read-only
+  # consumers of this cluster (monitors; domains/monitors/api_keys,
+  # respectively), same as api-service. Terraform resolves this
+  # forward reference fine (HCL dependencies aren't order-sensitive
+  # within one configuration) even though those security groups are
+  # declared later in this file, in their own Phase 5 section.
   allowed_security_group_ids = [
     aws_security_group.parser_lambda.id,
     aws_security_group.api_lambda.id,
     aws_security_group.billing_lambda.id,
+    aws_security_group.notifier_lambda.id,
+    aws_security_group.scheduler_lambda.id,
   ]
 
   min_capacity = 0.5
@@ -518,6 +527,27 @@ locals {
   }
 }
 
+# --- Licensing-only export bucket (Phase 5) ---------------------------------
+#
+# A SEPARATE bucket from `module.raw_crawl_bucket` (crawler-service's
+# raw crawl artifacts), not an `exports/` prefix inside that same
+# bucket -- see `api/config.py`'s `EXPORT_BUCKET_NAME` docstring for the
+# full rationale: api-service's Lambda role only ever needed READ
+# access to the raw crawl bucket before this phase (see
+# `api_lambda_permissions`'s `ReadOnlyRawCrawlBucketObjects` statement
+# below); adding a WRITE path to that same bucket, even prefix-scoped,
+# would broaden an existing grant rather than add a new, narrowly-scoped
+# one. A dedicated bucket keeps "what can write here" trivially
+# auditable (exactly one IAM statement, on exactly one bucket) instead
+# of requiring a reviewer to reason about a prefix condition on a
+# bucket something else already writes to.
+module "export_bucket" {
+  source = "../../modules/s3"
+
+  name = "agent-intelligence-exports-dev"
+  tags = local.api_tags
+}
+
 # --- Rate-limit table (free-tier per-IP counter) ----------------------------
 
 module "rate_limit_table" {
@@ -608,6 +638,21 @@ data "aws_iam_policy_document" "api_lambda_permissions" {
     resources = [module.rate_limit_table.table_arn]
   }
 
+  # Phase 5: POST /v1/export writes the NDJSON dump and then generates
+  # a presigned GET for it -- both PutObject (the write) and GetObject
+  # (S3 checks the CALLING IDENTITY's own permissions when a presigned
+  # URL is actually used, since a presigned URL is just that identity's
+  # signature over the request, not a standalone credential; the role
+  # that SIGNED the URL must itself be allowed to GetObject or the
+  # presigned URL will 403 for whoever uses it) are needed, scoped ONLY
+  # to this dedicated export bucket -- never broadened onto
+  # `module.raw_crawl_bucket` (see `module.export_bucket`'s comment).
+  statement {
+    sid       = "ReadWriteExportBucketObjects"
+    actions   = ["s3:PutObject", "s3:GetObject"]
+    resources = ["${module.export_bucket.bucket_arn}/*"]
+  }
+
   statement {
     sid     = "WriteOwnCloudWatchLogs"
     actions = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
@@ -646,9 +691,12 @@ module "api_lambda" {
   vpc_security_group_ids = [aws_security_group.api_lambda.id]
 
   environment_variables = {
-    RAW_DATA_BUCKET_NAME = module.raw_crawl_bucket.bucket_id
+    RAW_DATA_BUCKET_NAME  = module.raw_crawl_bucket.bucket_id
     RATE_LIMIT_TABLE_NAME = module.rate_limit_table.table_name
-    AWS_REGION             = var.region
+    AWS_REGION            = var.region
+
+    # Phase 5: POST /v1/export's destination bucket.
+    EXPORT_BUCKET_NAME = module.export_bucket.bucket_id
 
     DB_HOST       = module.parser_db.cluster_endpoint
     DB_PORT       = tostring(module.parser_db.port)
@@ -690,14 +738,21 @@ module "api_gateway" {
     # entirely separate service/deployable) gets its own instance below.
     "POST /v1/domains/bulk",
     "GET /v1/keys/me",
+    # Phase 5: monitor registration/deletion + licensing-only export --
+    # same reasoning, same HTTP API/Lambda, no new API Gateway instance.
+    "POST /v1/monitors",
+    "DELETE /v1/monitors/{monitor_id}",
+    "POST /v1/export",
   ]
 
-  # "*" methods was GET-only in Phase 3; POST added for the new bulk
-  # endpoint. Origins stay "*" -- see services/api-service/app.py's
+  # "*" methods was GET-only in Phase 3; POST added for the bulk
+  # endpoint (Phase 4); DELETE added for `DELETE /v1/monitors/{id}`
+  # (Phase 5). Origins stay "*" -- see services/api-service/app.py's
   # Phase 4 CORS comment for why bearer-token/API-key auth doesn't
   # carry the ambient-credential risk CORS exists to prevent, so this
-  # policy is unchanged from Phase 3's reasoning, just widened to POST.
-  cors_allow_methods = ["GET", "POST"]
+  # policy is unchanged from Phase 3's reasoning, just widened to POST
+  # and now DELETE too.
+  cors_allow_methods = ["GET", "POST", "DELETE"]
 
   tags = local.api_tags
 }
@@ -982,4 +1037,322 @@ output "amplify_app_id" {
 
 output "amplify_default_domain" {
   value = module.frontend_amplify.default_domain
+}
+
+# ---------------------------------------------------------------------------
+# Phase 5: notifier-service infrastructure (webhook delivery)
+# ---------------------------------------------------------------------------
+#
+# notifier-service consumes `notify-queue` (already provisioned in
+# Phase 2 above, DLQ already enabled -- see `module.notify_queue`) and
+# reads `monitors` (same Aurora cluster every other DB-touching service
+# in this env already shares -- see `module.parser_db`). It never
+# writes to Postgres and never calls any other AWS service besides SQS
+# (its trigger) and Secrets Manager (the DB password) -- its only
+# *outbound* traffic besides those is the webhook HTTP POST itself,
+# which is plain internet egress via the NAT gateway, not a permission
+# IAM has any say over.
+
+locals {
+  notifier_lambda_name = "agent-intel-dev-notifier"
+
+  notifier_tags = {
+    Environment = "dev"
+    Service     = "notifier-service"
+  }
+}
+
+resource "aws_security_group" "notifier_lambda" {
+  name_prefix = "${local.notifier_lambda_name}-"
+  description = "notifier-service Lambda -- outbound only (Postgres, Secrets Manager, and the customer webhook POSTs themselves, all via NAT)."
+  vpc_id      = module.network.vpc_id
+
+  tags = merge(local.notifier_tags, {
+    Name = "${local.notifier_lambda_name}-sg"
+  })
+}
+
+resource "aws_security_group_rule" "notifier_lambda_egress_all" {
+  type              = "egress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = "-1"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.notifier_lambda.id
+  description       = "All outbound -- Postgres (in-VPC), Secrets Manager (via NAT), and customer webhook endpoints (via NAT, the whole public internet by design -- customers register arbitrary https:// URLs, see shared_utils/webhook_safety.py for the SSRF-safety validation that constrains WHICH addresses those requests are actually allowed to reach at the application layer, since a security group can't express 'any https host except link-local/private/metadata addresses')."
+}
+
+data "aws_iam_policy_document" "notifier_lambda_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "notifier_lambda" {
+  name               = "${local.notifier_lambda_name}-role"
+  assume_role_policy = data.aws_iam_policy_document.notifier_lambda_assume_role.json
+
+  tags = local.notifier_tags
+}
+
+resource "aws_iam_role_policy_attachment" "notifier_lambda_vpc_access" {
+  role       = aws_iam_role.notifier_lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+data "aws_iam_policy_document" "notifier_lambda_permissions" {
+  statement {
+    sid       = "ConsumeNotifyQueue"
+    actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+    resources = [module.notify_queue.queue_arn]
+  }
+
+  statement {
+    sid       = "ReadDbMasterUserSecret"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [module.parser_db.master_user_secret_arn]
+  }
+
+  statement {
+    sid     = "WriteOwnCloudWatchLogs"
+    actions = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = [
+      "arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.notifier_lambda_name}:*"
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "notifier_lambda" {
+  name   = "${local.notifier_lambda_name}-policy"
+  role   = aws_iam_role.notifier_lambda.id
+  policy = data.aws_iam_policy_document.notifier_lambda_permissions.json
+}
+
+module "notifier_lambda" {
+  source = "../../modules/lambda"
+
+  name        = local.notifier_lambda_name
+  description = "Delivers webhook notifications to monitors when notify-queue reports a domain's record changed."
+  handler     = "notifier.handler.lambda_handler"
+  runtime     = "python3.11"
+  # A little more headroom than the other SQS-triggered Lambdas: each
+  # invocation may attempt several webhook deliveries (one per monitor
+  # on the domain), each with its own bounded retry/backoff (see
+  # services/notifier-service/notifier/config.py) -- 90s comfortably
+  # covers a worst-case batch without approaching the queue's own
+  # visibility timeout below.
+  timeout     = 90
+  memory_size = 256
+  role_arn    = aws_iam_role.notifier_lambda.arn
+
+  # Same caveat as every other service's `filename`: this deployment
+  # package doesn't exist yet -- produced by a build/CI step out of
+  # scope for this phase. This Terraform is structural, not applied (no
+  # `terraform` CLI is even installed locally).
+  filename = "${path.module}/../../../../services/notifier-service/dist/notifier-service.zip"
+
+  vpc_subnet_ids         = module.network.private_subnet_ids
+  vpc_security_group_ids = [aws_security_group.notifier_lambda.id]
+
+  environment_variables = {
+    AWS_REGION = var.region
+
+    DB_HOST       = module.parser_db.cluster_endpoint
+    DB_PORT       = tostring(module.parser_db.port)
+    DB_NAME       = module.parser_db.database_name
+    DB_USER       = module.parser_db.master_username
+    DB_SECRET_ARN = module.parser_db.master_user_secret_arn
+    # Deliberately no DB_PASSWORD/AWS_ENDPOINT_URL -- same exclusions as
+    # every other service's Lambda env vars above.
+  }
+
+  event_source_arn        = module.notify_queue.queue_arn
+  event_source_batch_size = 10
+
+  depends_on = [
+    aws_iam_role_policy.notifier_lambda,
+    aws_iam_role_policy_attachment.notifier_lambda_vpc_access,
+  ]
+
+  tags = local.notifier_tags
+}
+
+output "notifier_lambda_function_name" {
+  value = module.notifier_lambda.function_name
+}
+
+# ---------------------------------------------------------------------------
+# Phase 5: scheduler-service infrastructure (tiered recrawl cadence)
+# ---------------------------------------------------------------------------
+#
+# scheduler-service runs on an EventBridge scheduled rule (hourly --
+# see scheduler/handler.py's module docstring for why hourly is a
+# reasonable default distinct from any individual domain's own recrawl
+# cadence), reads `domains`/`monitors`/`api_keys` (the same Aurora
+# cluster every other DB-touching service shares), and enqueues due
+# domains back onto the EXISTING `crawl-queue` from Phase 1 -- reusing
+# that one entry point into the crawl pipeline rather than adding a
+# second one.
+
+locals {
+  scheduler_lambda_name = "agent-intel-dev-scheduler"
+
+  scheduler_tags = {
+    Environment = "dev"
+    Service     = "scheduler-service"
+  }
+}
+
+resource "aws_security_group" "scheduler_lambda" {
+  name_prefix = "${local.scheduler_lambda_name}-"
+  description = "scheduler-service Lambda -- outbound only (Postgres, Secrets Manager, SQS via NAT)."
+  vpc_id      = module.network.vpc_id
+
+  tags = merge(local.scheduler_tags, {
+    Name = "${local.scheduler_lambda_name}-sg"
+  })
+}
+
+resource "aws_security_group_rule" "scheduler_lambda_egress_all" {
+  type              = "egress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = "-1"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.scheduler_lambda.id
+  description       = "All outbound -- Postgres (in-VPC), Secrets Manager/SQS (via NAT)."
+}
+
+data "aws_iam_policy_document" "scheduler_lambda_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "scheduler_lambda" {
+  name               = "${local.scheduler_lambda_name}-role"
+  assume_role_policy = data.aws_iam_policy_document.scheduler_lambda_assume_role.json
+
+  tags = local.scheduler_tags
+}
+
+resource "aws_iam_role_policy_attachment" "scheduler_lambda_vpc_access" {
+  role       = aws_iam_role.scheduler_lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+data "aws_iam_policy_document" "scheduler_lambda_permissions" {
+  statement {
+    sid       = "ReadDbMasterUserSecret"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [module.parser_db.master_user_secret_arn]
+  }
+
+  statement {
+    sid       = "PublishCrawlQueue"
+    actions   = ["sqs:SendMessage"]
+    resources = [module.crawl_queue.queue_arn]
+  }
+
+  statement {
+    sid     = "WriteOwnCloudWatchLogs"
+    actions = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = [
+      "arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.scheduler_lambda_name}:*"
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "scheduler_lambda" {
+  name   = "${local.scheduler_lambda_name}-policy"
+  role   = aws_iam_role.scheduler_lambda.id
+  policy = data.aws_iam_policy_document.scheduler_lambda_permissions.json
+}
+
+module "scheduler_lambda" {
+  source = "../../modules/lambda"
+
+  name        = local.scheduler_lambda_name
+  description = "Decides which domains are due for recrawl (tiered cadence) and enqueues them onto crawl-queue."
+  handler     = "scheduler.handler.lambda_handler"
+  runtime     = "python3.11"
+  timeout     = 60
+  memory_size = 256
+  role_arn    = aws_iam_role.scheduler_lambda.arn
+
+  # Same caveat as every other service's `filename`.
+  filename = "${path.module}/../../../../services/scheduler-service/dist/scheduler-service.zip"
+
+  vpc_subnet_ids         = module.network.private_subnet_ids
+  vpc_security_group_ids = [aws_security_group.scheduler_lambda.id]
+
+  environment_variables = {
+    AWS_REGION      = var.region
+    CRAWL_QUEUE_URL = module.crawl_queue.queue_id
+
+    DB_HOST       = module.parser_db.cluster_endpoint
+    DB_PORT       = tostring(module.parser_db.port)
+    DB_NAME       = module.parser_db.database_name
+    DB_USER       = module.parser_db.master_username
+    DB_SECRET_ARN = module.parser_db.master_user_secret_arn
+    # Deliberately no DB_PASSWORD/AWS_ENDPOINT_URL -- same exclusions as
+    # every other service's Lambda env vars above.
+  }
+
+  # No event_source_arn -- this function is invoked by the EventBridge
+  # scheduled rule below, not an SQS event source mapping.
+
+  depends_on = [
+    aws_iam_role_policy.scheduler_lambda,
+    aws_iam_role_policy_attachment.scheduler_lambda_vpc_access,
+  ]
+
+  tags = local.scheduler_tags
+}
+
+# --- EventBridge scheduled rule ----------------------------------------------
+#
+# Hourly -- see scheduler/handler.py's module docstring for the
+# reasoning (frequent enough that a domain becoming due is never more
+# than an hour late, without invoking this Lambda at a frequency that
+# outpaces the fastest any domain is ever actually due, which is once a
+# day).
+
+resource "aws_cloudwatch_event_rule" "scheduler" {
+  name                = "${local.scheduler_lambda_name}-hourly"
+  description         = "Triggers scheduler-service hourly to enqueue domains due for recrawl."
+  schedule_expression = "rate(1 hour)"
+
+  tags = local.scheduler_tags
+}
+
+resource "aws_cloudwatch_event_target" "scheduler" {
+  rule = aws_cloudwatch_event_rule.scheduler.name
+  arn  = module.scheduler_lambda.function_arn
+}
+
+resource "aws_lambda_permission" "scheduler_eventbridge_invoke" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = module.scheduler_lambda.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.scheduler.arn
+}
+
+output "scheduler_lambda_function_name" {
+  value = module.scheduler_lambda.function_name
+}
+
+output "export_bucket_name" {
+  value = module.export_bucket.bucket_id
 }

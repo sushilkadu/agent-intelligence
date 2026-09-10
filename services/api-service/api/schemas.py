@@ -89,6 +89,43 @@ class BulkDomainsResponse(BaseModel):
     results: list[BulkDomainResult]
 
 
+class MonitorCreateRequest(BaseModel):
+    """`POST /v1/monitors` request body. `webhook_url` is validated for
+    SSRF safety (see `shared_utils.webhook_safety.validate_webhook_url`)
+    by the route itself, not by a Pydantic validator here -- that check
+    does real DNS resolution, which doesn't belong in a schema/type
+    validator that's also exercised by, e.g., OpenAPI schema generation.
+    """
+
+    domain: str = Field(..., min_length=1, description="Domain to watch for agent-identity signal changes.")
+    webhook_url: str = Field(..., description="https:// URL notified (via POST) when `domain`'s record changes.")
+
+
+class MonitorResponse(BaseModel):
+    """`POST /v1/monitors`'s response -- the created monitor. Includes
+    `owner_key_id` since the caller already knows it's their own key (it
+    authenticated as that key to create this monitor); not a leak of
+    someone else's identity.
+    """
+
+    monitor_id: str
+    domain: str
+    webhook_url: str
+    owner_key_id: str
+    created_at: str
+
+
+class ExportResponse(BaseModel):
+    """`POST /v1/export`'s response -- a presigned, time-limited URL to
+    the NDJSON dump this request just wrote to S3 (see api/export.py).
+    """
+
+    export_key: str = Field(..., description="S3 key the export was written to, scoped to the calling key.")
+    url: str = Field(..., description="Presigned GET URL for the export object.")
+    expires_in: int = Field(..., description="Seconds until the presigned URL expires.")
+    domain_count: int = Field(..., description="Number of `domains` rows included in this export.")
+
+
 class KeyUsageResponse(BaseModel):
     """`GET /v1/keys/me` -- backs the dashboard's usage panel."""
 
@@ -104,7 +141,10 @@ __all__ = [
     "BulkDomainsRequest",
     "BulkDomainsResponse",
     "DomainHistoryResponse",
+    "ExportResponse",
     "HistoryArtifactSummary",
     "HistorySnapshot",
     "KeyUsageResponse",
+    "MonitorCreateRequest",
+    "MonitorResponse",
 ]

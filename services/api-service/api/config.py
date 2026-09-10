@@ -106,6 +106,36 @@ BULK_MAX_DOMAINS = int(os.environ.get("BULK_MAX_DOMAINS", "100"))
 # calls paid endpoints."
 BULK_ALLOWED_PLAN_TIERS = ("self_serve", "licensing")
 
+# --- Monitor registration (Phase 5) -----------------------------------------
+#
+# Monitoring (webhook notifications on domain change) is a paid
+# feature, same tier gate as bulk lookup -- reusing the identical set
+# rather than inventing a second tuple that could silently drift from
+# BULK_ALLOWED_PLAN_TIERS.
+MONITOR_ALLOWED_PLAN_TIERS = BULK_ALLOWED_PLAN_TIERS
+
+# --- Licensing-only bulk export (Phase 5) -----------------------------------
+#
+# Only `licensing`-tier keys may dump the full `domains` table --
+# stricter than the bulk lookup / monitor tiers above, since this is a
+# full-dataset export, not a bounded per-request lookup.
+EXPORT_ALLOWED_PLAN_TIERS = ("licensing",)
+
+# Where export dumps are written. Deliberately a SEPARATE bucket from
+# RAW_DATA_BUCKET_NAME (crawler-service's raw crawl artifacts) rather
+# than an `exports/` prefix in that same bucket -- see envs/dev/main.tf's
+# comment on `export_bucket` for the full IAM-least-privilege rationale:
+# api-service's Lambda role only ever needed READ access to the raw
+# crawl bucket before this phase; adding a WRITE path to that same
+# bucket (even prefix-scoped) would broaden an existing grant instead of
+# adding a new, narrowly-scoped one.
+EXPORT_BUCKET_NAME = os.environ.get("EXPORT_BUCKET_NAME", "agent-intel-exports-dev")
+
+# How long a presigned export download URL remains valid. 15 minutes is
+# comfortably enough time for a customer to start the download without
+# leaving the link usable indefinitely.
+EXPORT_PRESIGNED_URL_EXPIRY_SECONDS = int(os.environ.get("EXPORT_PRESIGNED_URL_EXPIRY_SECONDS", "900"))
+
 __all__ = [
     "API_KEY_HEADER",
     "AWS_REGION",
@@ -117,9 +147,13 @@ __all__ = [
     "DB_PORT",
     "DB_SECRET_ARN",
     "DB_USER",
+    "EXPORT_ALLOWED_PLAN_TIERS",
+    "EXPORT_BUCKET_NAME",
+    "EXPORT_PRESIGNED_URL_EXPIRY_SECONDS",
     "HISTORY_DEFAULT_LIMIT",
     "HISTORY_MAX_LIMIT",
     "HISTORY_S3_LIST_CAP",
+    "MONITOR_ALLOWED_PLAN_TIERS",
     "RATE_LIMIT_PER_MINUTE",
     "RATE_LIMIT_TABLE_NAME",
     "RATE_LIMIT_WINDOW_SECONDS",

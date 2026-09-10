@@ -1,5 +1,17 @@
 # Local shared packages (editable installs, resolved via relative path)
--e ../../packages/shared-schema
+# notifier-service reads (never writes) `monitors` via psycopg2, hence
+# the [migrations] extra for its psycopg2 dependency -- same reasoning
+# as api-service's requirements.txt, notifier-service just never runs
+# Alembic itself.
+-e ../../packages/shared-schema[migrations]
 -e ../../packages/shared-utils
 
 pytest>=8.0,<9.0
+
+httpx>=0.27,<0.28
+boto3>=1.34,<2.0
+
+# test-only: mock HTTP (respx) and mock SQS (moto) so tests never touch
+# the real network or real AWS.
+respx>=0.20,<0.22
+moto[sqs]>=5.0,<6.0

@@ -22,7 +22,7 @@ from typing import Any
 import httpx
 from shared_utils import get_logger
 
-from .config import RAW_DATA_BUCKET_NAME, RAW_FETCHED_QUEUE_URL
+from .config import CRAWL_LLMS_TXT_ENABLED, RAW_DATA_BUCKET_NAME, RAW_FETCHED_QUEUE_URL
 from .fetch import crawl_domain
 from .messaging import build_raw_fetched_message, get_sqs_client, publish_raw_fetched
 from .storage import get_s3_client, store_fetch_result
@@ -78,6 +78,16 @@ async def process_domain(
         s3_client, bucket, domain, crawled_at, "web-bot-auth-directory", result.web_bot_auth
     )
 
+    # llms.txt is only ever stored when the fetch was actually
+    # attempted (CRAWL_LLMS_TXT_ENABLED) -- storing a "not fetched"
+    # placeholder envelope for every domain regardless of the flag
+    # would just be noise in S3, and llms_txt_s3_key must stay None
+    # (not present at all) when this crawl never asked the flag's
+    # question, matching build_raw_fetched_message's contract.
+    llms_txt_key = None
+    if CRAWL_LLMS_TXT_ENABLED:
+        llms_txt_key = store_fetch_result(s3_client, bucket, domain, crawled_at, "llms.txt", result.llms_txt)
+
     message = build_raw_fetched_message(
         domain=domain,
         crawled_at=crawled_at,
@@ -87,13 +97,18 @@ async def process_domain(
         web_bot_auth_present=result.web_bot_auth.present,
         web_bot_auth_status_code=result.web_bot_auth.status_code,
         web_bot_auth_s3_key=web_bot_auth_key,
+        llms_txt_present=result.llms_txt.present if CRAWL_LLMS_TXT_ENABLED else False,
+        llms_txt_status_code=result.llms_txt.status_code if CRAWL_LLMS_TXT_ENABLED else None,
+        llms_txt_s3_key=llms_txt_key,
+        on_chain_ref=result.on_chain_ref,
     )
     message_id = publish_raw_fetched(sqs_client, raw_fetched_queue_url, message)
     logger.info(
-        "crawled %s: agents.json present=%s web_bot_auth present=%s -> raw-fetched message %s",
+        "crawled %s: agents.json present=%s web_bot_auth present=%s llms_txt present=%s -> raw-fetched message %s",
         domain,
         result.agents_json.present,
         result.web_bot_auth.present,
+        result.llms_txt.present if CRAWL_LLMS_TXT_ENABLED else "disabled",
         message_id,
     )
     return message
