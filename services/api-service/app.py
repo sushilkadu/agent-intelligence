@@ -2,9 +2,18 @@
 
 Phase 3: real public, unauthenticated, read-only lookup endpoints
 (`GET /v1/domains/{domain}`, `GET /v1/domains/{domain}/history`) plus a
-free-tier per-IP rate limiter. See `api/routes.py` for the endpoints,
-`api/db.py`/`api/history.py` for how they read Postgres/S3, and
-`api/ratelimit.py` for the rate limiter.
+free-tier per-IP rate limiter.
+
+Phase 4: optional `X-API-Key` auth on those same two routes (still
+free-tier/IP-limited with no key, key-tier-limited with one -- see
+`api/auth.py`), a paid-tier-only bulk lookup route
+(`POST /v1/domains/bulk`), and a key-usage route (`GET /v1/keys/me`).
+API keys themselves are issued by billing-service, not here -- this
+service only ever reads `api_keys` (see `api/db.py`'s
+`fetch_api_key_by_hash`).
+
+See `api/routes.py` for the endpoints, `api/db.py`/`api/history.py` for
+how they read Postgres/S3, and `api/ratelimit.py` for the rate limiter.
 
 This one FastAPI app is the single implementation of the route logic,
 run two ways:
@@ -29,23 +38,39 @@ app = FastAPI(title="Agent Intelligence API Service")
 
 # --- CORS ----------------------------------------------------------------
 #
-# Permissive by design for these two routes specifically: this is a
-# public, unauthenticated, read-only GET lookup API with no cookies,
-# sessions, or credentials involved anywhere in the request -- there is
-# no cross-site state for a permissive CORS policy to leak or let
-# anyone else act on behalf of a user. Any site should be able to embed
-# a "check this domain" widget against it directly from the browser.
-# `allow_credentials` is left at its default (False) since nothing here
-# uses cookies/auth headers.
+# Phase 3 shipped this permissive for the two unauthenticated GET
+# routes and flagged "reconsider once API keys/billing are involved"
+# for whoever picked up Phase 4. Having now added API-key auth and a
+# paid POST route, the reconsideration is: keep it permissive, `*`
+# included -- but for a reason specific to bearer-token auth, not
+# because it stopped mattering.
 #
-# This is NOT the policy Phase 4's authenticated/paid endpoints should
-# reuse -- once API keys/billing are involved, CORS needs to be scoped
-# to known frontend origins, not "*". Flagged again in the Phase 3
-# report for whoever picks up Phase 4.
+# CORS exists to stop a malicious page from riding a VICTIM'S AMBIENT
+# credentials (cookies, browser-managed HTTP auth) to a third-party API
+# without the victim's knowledge -- that's what "credentialed
+# cross-origin request" means, and it's exactly what CORS's
+# `allow_credentials`/origin-allowlist machinery is built to gate.
+# Nothing in this API is ambient: there are no cookies, no sessions, and
+# the browser never attaches `X-API-Key` on its own. A caller's JS has
+# to already possess the key and set the header itself for any request
+# (same-origin or cross-origin) to succeed at all -- so a malicious
+# third-party page embedding this API can only ever act with a key IT
+# already has, never one belonging to some other site's visitor. That's
+# the textbook case (bearer-token/API-key auth, unlike cookie auth) where
+# permissive CORS carries none of the risk it exists to prevent -- see
+# the Phase 4 build plan's own framing of this same point.
+# `allow_credentials` stays at its default (False): this API is never
+# meant to be called WITH cookies, so there's no reason to opt into
+# the one CORS mode that would actually reintroduce ambient-credential
+# risk.
+#
+# `allow_methods` adds POST for `POST /v1/domains/bulk`; `allow_headers`
+# was already `"*"`, which covers the new `X-API-Key` header without a
+# change.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 

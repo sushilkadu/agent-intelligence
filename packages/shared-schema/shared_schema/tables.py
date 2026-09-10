@@ -81,6 +81,29 @@ api_keys = Table(
         nullable=False,
     ),
     Column("rate_limit", Integer, nullable=False),
+    # --- Phase 4 additions -- see alembic/versions/<rev>_api_key_auth_and_billing.py
+    # for the full rationale; kept in sync here per this module's
+    # docstring (mirror models.py's `ApiKey` field-for-field).
+    #
+    # SHA-256 hex digest of the real bearer secret. Unique + not null:
+    # every key row is created with a real, distinct secret already
+    # hashed -- this is what auth looks up by, never `key_id`.
+    Column("key_hash", String, nullable=False, unique=True),
+    # False once a Stripe subscription is canceled -- see models.py.
+    Column("active", Boolean, nullable=False, server_default=text("true")),
+    # Nullable + unique: null for out-of-band (licensing) keys that
+    # never touch Stripe; unique so a customer maps to at most one live
+    # api_keys row per Stripe customer.
+    Column("stripe_customer_id", String, nullable=True, unique=True),
+    Column("stripe_subscription_id", String, nullable=True),
+    # Nullable + unique: the Checkout Session that created this row --
+    # the idempotency key for webhook processing (see billing-service's
+    # webhook handler) and the lookup key for the one-time key-retrieval
+    # endpoint.
+    Column("stripe_checkout_session_id", String, nullable=True, unique=True),
+    # KNOWN GAP, see models.py's docstring on this field: transient
+    # plaintext-secret holding cell for the no-email MVP retrieval flow.
+    Column("pending_secret", String, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
 )
 

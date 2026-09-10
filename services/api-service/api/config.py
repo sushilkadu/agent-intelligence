@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 
+from shared_utils import API_KEY_HEADER
+
 # --- AWS resource configuration ------------------------------------------------
 #
 # Same `AWS_ENDPOINT_URL` convention as crawler/parser-service: set
@@ -76,8 +78,39 @@ RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "60"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
 RATE_LIMIT_TABLE_NAME = os.environ.get("RATE_LIMIT_TABLE_NAME", "agent-intel-dev-rate-limit")
 
+# --- API-key auth (Phase 4) ------------------------------------------------
+#
+# See api/auth.py's module docstring for the full design. Header name
+# is a judgment call -- `X-API-Key` is the de-facto convention for
+# bearer-style API keys (Stripe, SendGrid, etc. all use variants of
+# it), and is re-exported from `shared_utils.api_keys` so
+# billing-service's key-retrieval response can tell customers the exact
+# header name to use without api-service and billing-service risking
+# disagreeing on it.
+
+# --- Bulk lookup endpoint (Phase 4) ----------------------------------------
+#
+# `POST /v1/domains/bulk` caps how many domains one request may ask
+# for. The build plan says "cap the list length sensibly (e.g. 100 per
+# request)" -- 100 is used as-is: large enough to be genuinely useful
+# for a paid bulk-lookup tier, small enough that one request can never
+# turn into an unbounded number of `domains` lookups or DynamoDB rate
+# writes.
+BULK_MAX_DOMAINS = int(os.environ.get("BULK_MAX_DOMAINS", "100"))
+
+# Plan tiers allowed to call the bulk endpoint. `free` is deliberately
+# excluded: free tier is the unauthenticated, per-IP-limited path (see
+# api/ratelimit.py) -- a free-tier API key existing at all would be a
+# contradiction of that design, so this list, not a "tier != free"
+# check, is the source of truth for "which tiers may hold a key that
+# calls paid endpoints."
+BULK_ALLOWED_PLAN_TIERS = ("self_serve", "licensing")
+
 __all__ = [
+    "API_KEY_HEADER",
     "AWS_REGION",
+    "BULK_ALLOWED_PLAN_TIERS",
+    "BULK_MAX_DOMAINS",
     "DB_HOST",
     "DB_NAME",
     "DB_PASSWORD",

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { FormEvent, ReactNode, useState } from "react";
 
 // Configurable so this same build can point at a deployed api-service
@@ -143,6 +144,13 @@ export default function Home() {
         </form>
 
         <ResultsPanel state={state} />
+
+        <Link
+          href="/dashboard"
+          className="text-xs text-zinc-400 underline underline-offset-2 dark:text-zinc-500"
+        >
+          Need bulk lookups or a higher rate limit? Subscribe or sign in →
+        </Link>
       </main>
     </div>
   );

@@ -1,8 +1,32 @@
 # Local shared packages (editable installs, resolved via relative path)
--e ../../packages/shared-schema
+# billing-service both reads AND writes `api_keys` (issuance + Stripe
+# lifecycle management -- see billing/db.py), so like parser-service it
+# needs the [migrations] extra for psycopg2. It does NOT run Alembic
+# itself at runtime, same as parser-service/api-service -- the extra is
+# just how psycopg2 is pulled in.
+-e ../../packages/shared-schema[migrations]
 -e ../../packages/shared-utils
 
 fastapi>=0.110,<0.120
 uvicorn[standard]>=0.29,<0.35
 pytest>=8.0,<9.0
 httpx>=0.27,<0.28
+
+# Lets Pydantic evaluate `X | None`-style annotations on Python <3.10
+# (see api-service's requirements.txt for the same note -- a no-op on
+# the python3.11 Lambda runtime this service deploys to).
+eval-type-backport>=0.2,<0.3
+
+boto3>=1.34,<2.0
+
+# ASGI-on-Lambda adapter (see api-service's requirements.txt/app.py --
+# same reasoning: wraps the FastAPI app for API Gateway HTTP API
+# events without forking the route logic).
+mangum>=0.17,<0.20
+
+# Official Stripe SDK. This environment has no real Stripe test-mode
+# key/network access (see billing/stripe_client.py's module docstring)
+# -- Checkout/portal session creation is monkeypatched in tests; webhook
+# signature verification is real, local HMAC-SHA256 crypto and needs no
+# network access at all.
+stripe>=10.0,<12.0

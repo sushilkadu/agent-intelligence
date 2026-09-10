@@ -56,12 +56,56 @@ class Domain(BaseModel):
 
 
 class ApiKey(BaseModel):
-    """An issued API key for the paid/free lookup API."""
+    """An issued API key for the paid/free lookup API.
 
-    key_id: str = Field(..., description="Primary key")
+    Phase 4 note: `key_id` is a non-secret identifier only -- it is
+    NOT the bearer credential a caller authenticates with. The actual
+    high-entropy secret (`ai_live_...`, see
+    `shared_utils.api_keys.generate_api_key_secret`) is generated once
+    at issuance, shown to the customer exactly once, and never stored.
+    `key_hash` (its SHA-256 hex digest) is what auth actually looks up
+    by -- this is the same "never store the usable credential in
+    plaintext" principle as password hashing, applied to API keys.
+    """
+
+    key_id: str = Field(..., description="Primary key -- a non-secret identifier, not the bearer credential itself")
     owner_email: str
     plan_tier: PlanTier
     rate_limit: int = Field(..., description="Requests allowed per window, e.g. per minute")
+
+    key_hash: str = Field(
+        ..., description="SHA-256 hex digest of the actual bearer secret -- what auth looks up by. Never the plaintext."
+    )
+
+    active: bool = Field(
+        True,
+        description="False once a subscription is canceled/deactivated -- key rows are kept (not deleted) so "
+        "history/audit trails survive cancellation; an inactive key fails auth even if key_hash matches.",
+    )
+
+    stripe_customer_id: Optional[str] = Field(
+        None, description="Stripe Customer id, for self-serve keys issued via Checkout. Null for out-of-band (licensing) keys."
+    )
+    stripe_subscription_id: Optional[str] = Field(
+        None, description="Stripe Subscription id backing this key's plan, kept in sync via webhook events."
+    )
+    stripe_checkout_session_id: Optional[str] = Field(
+        None,
+        description="The Checkout Session id that created this key. Unique -- lets webhook processing be idempotent "
+        "(a redelivered `checkout.session.completed` for the same session is a no-op, not a second row) and lets "
+        "GET /v1/billing/session/{id} find this row without a second Stripe round-trip.",
+    )
+
+    pending_secret: Optional[str] = Field(
+        None,
+        description="KNOWN GAP (see billing-service's Phase 4 report): the plaintext bearer secret, held here only "
+        "transiently between issuance and its first retrieval via GET /v1/billing/session/{id}, then cleared to "
+        "NULL. This is a pragmatic MVP substitute for emailing the customer their key (no email-sending service "
+        "exists anywhere in this architecture yet) -- it is a real plaintext-secret-at-rest window, not a "
+        "'shown exactly once and never persisted' guarantee. Must never be included in any response model besides "
+        "the one-time retrieval endpoint's.",
+    )
+
     created_at: datetime
 
 

@@ -334,8 +334,16 @@ module "parser_db" {
   # api-service's Lambda (Phase 3) is a read-only consumer of the same
   # `domains` table parser-service writes -- added to this list rather
   # than standing up a second database, since there's exactly one
-  # `domains` table and both services need to reach it.
-  allowed_security_group_ids = [aws_security_group.parser_lambda.id, aws_security_group.api_lambda.id]
+  # `domains` table and both services need to reach it. billing-service's
+  # Lambda (Phase 4, declared further below) is added the same way --
+  # it's the one service that WRITES to `api_keys` (issuance + Stripe
+  # lifecycle), reusing this same cluster rather than standing up a
+  # second database for one more table.
+  allowed_security_group_ids = [
+    aws_security_group.parser_lambda.id,
+    aws_security_group.api_lambda.id,
+    aws_security_group.billing_lambda.id,
+  ]
 
   min_capacity = 0.5
   max_capacity = 2
@@ -668,16 +676,267 @@ module "api_gateway" {
   source = "../../modules/api_gateway"
 
   name        = "${local.api_lambda_name}-http"
-  description = "Public lookup API -- GET /v1/domains/{domain}, GET /v1/domains/{domain}/history."
+  description = "Public + paid lookup API -- domain lookup/history/bulk, API-key auth, per-tier rate limiting."
 
-  lambda_invoke_arn     = module.api_lambda.invoke_arn
-  lambda_function_name  = module.api_lambda.function_name
+  lambda_invoke_arn    = module.api_lambda.invoke_arn
+  lambda_function_name = module.api_lambda.function_name
   routes = [
     "GET /v1/domains/{domain}",
     "GET /v1/domains/{domain}/history",
+    # Phase 4: paid-tier bulk lookup + key usage. Both still go through
+    # this SAME HTTP API/Lambda (api-service's own FastAPI app already
+    # dispatches all of these internally -- see api/routes.py) rather
+    # than a second API Gateway instance; only billing-service (an
+    # entirely separate service/deployable) gets its own instance below.
+    "POST /v1/domains/bulk",
+    "GET /v1/keys/me",
   ]
 
+  # "*" methods was GET-only in Phase 3; POST added for the new bulk
+  # endpoint. Origins stay "*" -- see services/api-service/app.py's
+  # Phase 4 CORS comment for why bearer-token/API-key auth doesn't
+  # carry the ambient-credential risk CORS exists to prevent, so this
+  # policy is unchanged from Phase 3's reasoning, just widened to POST.
+  cors_allow_methods = ["GET", "POST"]
+
   tags = local.api_tags
+}
+
+# ---------------------------------------------------------------------------
+# Phase 4: billing-service infrastructure (Stripe Checkout/webhook + key
+# issuance)
+# ---------------------------------------------------------------------------
+#
+# billing-service is its OWN independently-deployable service per the
+# architecture table (not merged into api-service's API Gateway/Lambda)
+# -- own HTTP API, own Lambda, own IAM role. It reuses the same Aurora
+# cluster api-service/parser-service already share (see
+# `module.parser_db`'s `allowed_security_group_ids` above), since
+# `api_keys` lives in that same database; it does NOT reuse api-service's
+# rate-limit DynamoDB table or any of its IAM permissions -- api-service's
+# existing Lambda role needs no new AWS permissions for Phase 4's
+# API-key auth (it's all DB-based reads it already has access to).
+
+locals {
+  billing_lambda_name = "agent-intel-dev-billing"
+
+  billing_tags = {
+    Environment = "dev"
+    Service     = "billing-service"
+  }
+}
+
+# --- Stripe secrets ----------------------------------------------------------
+#
+# Created EMPTY (no `secret_string`) -- populated out-of-band (AWS
+# console/CLI) once a real Stripe account exists, never through a
+# Terraform variable/plan/state. Same reasoning the `secrets` module's
+# own docstring gives for why it exists alongside the RDS module's
+# AWS-managed master password: these two values have no native
+# "AWS manages this for me" option the way the DB password does, but
+# still shouldn't ever be plaintext in tfstate.
+module "stripe_secret_key" {
+  source = "../../modules/secrets"
+
+  name        = "${local.billing_lambda_name}-stripe-secret-key"
+  description = "Stripe secret key (sk_live_/sk_test_) -- populated out-of-band once a real Stripe account exists."
+
+  tags = local.billing_tags
+}
+
+module "stripe_webhook_secret" {
+  source = "../../modules/secrets"
+
+  name        = "${local.billing_lambda_name}-stripe-webhook-secret"
+  description = "Stripe webhook signing secret (whsec_...) -- populated out-of-band once a real Stripe webhook endpoint is registered."
+
+  tags = local.billing_tags
+}
+
+# --- billing Lambda's security group ----------------------------------------
+# Same shape as parser_lambda's/api_lambda's: no ingress (API Gateway
+# invokes Lambda directly), egress needed to reach Postgres (in-VPC)
+# and Secrets Manager/Stripe (via NAT).
+resource "aws_security_group" "billing_lambda" {
+  name_prefix = "${local.billing_lambda_name}-"
+  description = "billing-service Lambda -- outbound only (Postgres, Secrets Manager, Stripe API via NAT)."
+  vpc_id      = module.network.vpc_id
+
+  tags = merge(local.billing_tags, {
+    Name = "${local.billing_lambda_name}-sg"
+  })
+}
+
+resource "aws_security_group_rule" "billing_lambda_egress_all" {
+  type              = "egress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = "-1"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.billing_lambda.id
+  description       = "All outbound -- Postgres (in-VPC), Secrets Manager/Stripe API (via NAT)."
+}
+
+# --- IAM: least-privilege billing Lambda execution role ---------------------
+#
+# Scoped to exactly what billing-service needs: read/write access to
+# the DB master-user secret (same cluster api-service/parser-service
+# use -- DB-user-level permissions, not IAM, govern read-only vs.
+# read-write, same as those two services), read access to EXACTLY the
+# two Stripe secrets above (nothing broader -- no wildcard resource
+# ARNs), plus the standard VPC-attached-Lambda managed policy and its
+# own CloudWatch log group.
+
+data "aws_iam_policy_document" "billing_lambda_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "billing_lambda" {
+  name               = "${local.billing_lambda_name}-role"
+  assume_role_policy = data.aws_iam_policy_document.billing_lambda_assume_role.json
+
+  tags = local.billing_tags
+}
+
+resource "aws_iam_role_policy_attachment" "billing_lambda_vpc_access" {
+  role       = aws_iam_role.billing_lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+data "aws_iam_policy_document" "billing_lambda_permissions" {
+  statement {
+    sid       = "ReadDbMasterUserSecret"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [module.parser_db.master_user_secret_arn]
+  }
+
+  statement {
+    sid       = "ReadStripeSecrets"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [module.stripe_secret_key.secret_arn, module.stripe_webhook_secret.secret_arn]
+  }
+
+  statement {
+    sid     = "WriteOwnCloudWatchLogs"
+    actions = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = [
+      "arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.billing_lambda_name}:*"
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "billing_lambda" {
+  name   = "${local.billing_lambda_name}-policy"
+  role   = aws_iam_role.billing_lambda.id
+  policy = data.aws_iam_policy_document.billing_lambda_permissions.json
+}
+
+# --- billing Lambda ----------------------------------------------------------
+
+module "billing_lambda" {
+  source = "../../modules/lambda"
+
+  name        = local.billing_lambda_name
+  description = "Stripe Checkout + webhook-driven API key issuance/lifecycle, and the customer billing portal."
+  handler     = "app.handler"
+  runtime     = "python3.11"
+  timeout     = 30
+  memory_size = 256
+  role_arn    = aws_iam_role.billing_lambda.arn
+
+  # Same caveat as every other service's `filename`: this deployment
+  # package doesn't exist yet -- produced by a build/CI step out of
+  # scope for this phase. This Terraform is structural, not applied.
+  filename = "${path.module}/../../../../services/billing-service/dist/billing-service.zip"
+
+  vpc_subnet_ids         = module.network.private_subnet_ids
+  vpc_security_group_ids = [aws_security_group.billing_lambda.id]
+
+  environment_variables = {
+    AWS_REGION = var.region
+
+    DB_HOST       = module.parser_db.cluster_endpoint
+    DB_PORT       = tostring(module.parser_db.port)
+    DB_NAME       = module.parser_db.database_name
+    DB_USER       = module.parser_db.master_username
+    DB_SECRET_ARN = module.parser_db.master_user_secret_arn
+
+    STRIPE_SECRET_KEY_ARN     = module.stripe_secret_key.secret_arn
+    STRIPE_WEBHOOK_SECRET_ARN = module.stripe_webhook_secret.secret_arn
+
+    # Deliberately NOT set here (rather than set to ""): STRIPE_SELF_SERVE_PRICE_ID,
+    # FRONTEND_BASE_URL, CORS_ALLOWED_ORIGINS. An empty-string env var
+    # would still count as "set" to billing/config.py's
+    # `os.environ.get(NAME, default)` calls and silently override its
+    # sensible defaults with an unusable empty value -- omitting the
+    # key entirely is what actually lets those Python-side defaults
+    # apply until this environment has real values (a real Stripe
+    # Price id, the deployed Amplify domain -- see
+    # `module.frontend_amplify.default_domain` -- for FRONTEND_BASE_URL/
+    # CORS_ALLOWED_ORIGINS) to set here instead.
+    #
+    # Deliberately no DB_PASSWORD/STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET
+    # plaintext here -- both resolved from Secrets Manager at runtime
+    # (see billing/db.py's `_resolve_password` /
+    # billing/stripe_client.py's `_resolve_secret`). Deliberately no
+    # AWS_ENDPOINT_URL -- local-dev-only, see billing/config.py.
+  }
+
+  depends_on = [aws_iam_role_policy.billing_lambda, aws_iam_role_policy_attachment.billing_lambda_vpc_access]
+
+  tags = local.billing_tags
+}
+
+# --- HTTP API (API Gateway v2) -- billing-service's OWN instance ------------
+
+module "billing_api_gateway" {
+  source = "../../modules/api_gateway"
+
+  name        = "${local.billing_lambda_name}-http"
+  description = "Stripe Checkout/webhook + key retrieval/portal endpoints for billing-service."
+
+  lambda_invoke_arn    = module.billing_lambda.invoke_arn
+  lambda_function_name = module.billing_lambda.function_name
+  routes = [
+    "POST /v1/billing/checkout",
+    "POST /v1/billing/webhook",
+    "GET /v1/billing/session/{checkout_session_id}",
+    "POST /v1/billing/portal",
+  ]
+
+  # Scoped to the frontend's origin (billing/config.py's own default),
+  # NOT "*" -- see billing/config.py's `CORS_ALLOWED_ORIGINS` docstring
+  # for why this service's CORS calculus differs from api-service's
+  # permissive public GET routes. Mirrored here (same reasoning as
+  # Phase 3's api_gateway module CORS config) so the policy applies
+  # whether or not FastAPI's own CORSMiddleware runs.
+  cors_allow_origins = ["http://localhost:3000"]
+  cors_allow_methods = ["GET", "POST"]
+
+  tags = local.billing_tags
+}
+
+output "billing_lambda_function_name" {
+  value = module.billing_lambda.function_name
+}
+
+output "billing_api_gateway_endpoint" {
+  value = module.billing_api_gateway.api_endpoint
+}
+
+output "stripe_secret_key_arn" {
+  value = module.stripe_secret_key.secret_arn
+}
+
+output "stripe_webhook_secret_arn" {
+  value = module.stripe_webhook_secret.secret_arn
 }
 
 # --- Frontend (Amplify Hosting) ---------------------------------------------
@@ -695,7 +954,8 @@ module "frontend_amplify" {
   branch_name          = "main"
 
   environment_variables = {
-    NEXT_PUBLIC_API_BASE_URL = module.api_gateway.api_endpoint
+    NEXT_PUBLIC_API_BASE_URL     = module.api_gateway.api_endpoint
+    NEXT_PUBLIC_BILLING_BASE_URL = module.billing_api_gateway.api_endpoint
   }
 
   tags = {

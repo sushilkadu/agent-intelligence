@@ -74,4 +74,34 @@ def fetch_domain(conn, domain: str) -> dict[str, Any] | None:
         return dict(row) if row is not None else None
 
 
-__all__ = ["fetch_domain", "get_connection"]
+def fetch_domains_bulk(conn, domains: list[str]) -> dict[str, dict[str, Any]]:
+    """Return every `domains` row matching `domains`, keyed by domain.
+
+    A domain with no row simply has no key in the returned dict --
+    callers (see `api/routes.py`'s bulk endpoint) turn that into a
+    per-domain "not found" marker rather than a request-level 404,
+    since a bulk lookup is expected to mix hits and misses.
+    """
+    if not domains:
+        return {}
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM domains WHERE domain = ANY(%s)", (domains,))
+        rows = cur.fetchall()
+        return {row["domain"]: dict(row) for row in rows}
+
+
+def fetch_api_key_by_hash(conn, key_hash: str) -> dict[str, Any] | None:
+    """Return the `api_keys` row whose `key_hash` matches, or None.
+
+    api-service never writes to `api_keys` (billing-service owns
+    issuance/lifecycle writes -- see services/billing-service/billing/db.py)
+    -- this is a read-only lookup, same read-only relationship
+    api-service already has with `domains`.
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM api_keys WHERE key_hash = %s", (key_hash,))
+        row = cur.fetchone()
+        return dict(row) if row is not None else None
+
+
+__all__ = ["fetch_api_key_by_hash", "fetch_domain", "fetch_domains_bulk", "get_connection"]

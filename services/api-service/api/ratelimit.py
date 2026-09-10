@@ -120,18 +120,89 @@ def check_and_increment(
     return count <= limit, count
 
 
-def build_rate_limited_error(*, limit: int, window_seconds: int) -> dict[str, Any]:
-    """The clean 429 error body returned when a caller exceeds the
-    free-tier limit.
+def build_rate_limited_error(*, limit: int, window_seconds: int, tier: str = "free") -> dict[str, Any]:
+    """The clean 429 error body returned when a caller exceeds their
+    tier's limit (free-tier IP limiting, or an authenticated key's own
+    `rate_limit` -- see Phase 4's `check_and_increment_for_key`).
     """
     return {
         "error": "rate_limit_exceeded",
         "message": (
             f"Rate limit exceeded: this API allows {limit} requests per "
-            f"{window_seconds} seconds on the free tier. Please slow down and "
+            f"{window_seconds} seconds on the {tier} tier. Please slow down and "
             "try again shortly."
         ),
     }
 
 
-__all__ = ["build_rate_limited_error", "check_and_increment", "get_dynamodb_client"]
+# --- Phase 4: authenticated (API-key) rate limiting -------------------------
+#
+# Reuses `check_and_increment` as-is rather than writing a parallel
+# implementation -- the function was already generic on "an identifier
+# string to key the fixed window by" (its `ip` parameter), just named
+# for its one Phase 3 caller. The only thing Phase 4 needs is a
+# different identifier (`key_id`) and that key's own `rate_limit`
+# instead of the flat free-tier default, both of which the existing
+# signature already accepts. A `key:` prefix on the item id keeps an
+# authenticated caller's window in a distinct DynamoDB item from any
+# IP-keyed window, so a key_id that happened to collide with someone's
+# IP string could never share a counter.
+def _key_item_subject(key_id: str) -> str:
+    return f"key:{key_id}"
+
+
+def check_and_increment_for_key(
+    client,
+    table_name: str,
+    key_id: str,
+    *,
+    limit: int,
+    window_seconds: int = RATE_LIMIT_WINDOW_SECONDS,
+    now: float | None = None,
+) -> tuple[bool, int]:
+    """Same fixed-window counter as `check_and_increment`, keyed by an
+    authenticated API key's `key_id` (see `api/auth.py`) instead of a
+    caller's IP, and enforced against that key's own `rate_limit`
+    (looked up from its `api_keys` row) instead of the free-tier flat
+    rate.
+    """
+    return check_and_increment(
+        client,
+        table_name,
+        _key_item_subject(key_id),
+        limit=limit,
+        window_seconds=window_seconds,
+        now=now,
+    )
+
+
+def get_current_window_count(
+    client,
+    table_name: str,
+    key_id: str,
+    *,
+    window_seconds: int = RATE_LIMIT_WINDOW_SECONDS,
+    now: float | None = None,
+) -> int:
+    """Read (without incrementing) how many requests an API key has
+    made in its *current* fixed window -- backs the dashboard's
+    "current window usage" display (`GET /v1/keys/me`). A plain
+    `GetItem`, not the atomic `ADD` used by `check_and_increment*`,
+    since this deliberately does not count as a request itself.
+    """
+    now = now if now is not None else time.time()
+    item_id = _window_item_id(_key_item_subject(key_id), window_seconds, now)
+    response = client.get_item(TableName=table_name, Key={"id": {"S": item_id}})
+    item = response.get("Item")
+    if item is None:
+        return 0
+    return int(item["request_count"]["N"])
+
+
+__all__ = [
+    "build_rate_limited_error",
+    "check_and_increment",
+    "check_and_increment_for_key",
+    "get_current_window_count",
+    "get_dynamodb_client",
+]

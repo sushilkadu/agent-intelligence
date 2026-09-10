@@ -21,7 +21,11 @@ internal field split.
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
+
+from .config import BULK_MAX_DOMAINS
 
 
 class HistoryArtifactSummary(BaseModel):
@@ -52,4 +56,55 @@ class DomainHistoryResponse(BaseModel):
     snapshots: list[HistorySnapshot]
 
 
-__all__ = ["DomainHistoryResponse", "HistoryArtifactSummary", "HistorySnapshot"]
+class BulkDomainsRequest(BaseModel):
+    """`POST /v1/domains/bulk` request body. `domains` is capped at
+    `BULK_MAX_DOMAINS` (see api/config.py's docstring on why 100) --
+    pydantic rejects an over-cap list with a 422 before the route body
+    ever runs, so there's no path where an unbounded list reaches the
+    DB query.
+    """
+
+    domains: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=BULK_MAX_DOMAINS,
+        description=f"Domains to look up, 1-{BULK_MAX_DOMAINS} per request.",
+    )
+
+
+class BulkDomainResult(BaseModel):
+    """One domain's result within a bulk response -- a per-domain
+    not-found marker (`found=False`, `record=None`), never a
+    request-level 404, since a bulk request mixing hits and misses is
+    the expected case.
+    """
+
+    domain: str
+    found: bool
+    record: dict[str, Any] | None = None
+
+
+class BulkDomainsResponse(BaseModel):
+    count: int = Field(..., description="Number of results in this response (== len(domains) requested)")
+    results: list[BulkDomainResult]
+
+
+class KeyUsageResponse(BaseModel):
+    """`GET /v1/keys/me` -- backs the dashboard's usage panel."""
+
+    key_id: str
+    plan_tier: str
+    rate_limit: int = Field(..., description="Requests allowed per window for this key")
+    window_seconds: int
+    current_window_count: int = Field(..., description="Requests this key has made in the CURRENT window so far")
+
+
+__all__ = [
+    "BulkDomainResult",
+    "BulkDomainsRequest",
+    "BulkDomainsResponse",
+    "DomainHistoryResponse",
+    "HistoryArtifactSummary",
+    "HistorySnapshot",
+    "KeyUsageResponse",
+]
