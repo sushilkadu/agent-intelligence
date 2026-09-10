@@ -31,28 +31,38 @@ fires webhooks to `monitors` when a watched domain's data changes →
 
 ## Build phases
 
-This repo is being built in phases. **We are currently on Phase 1.**
+This repo was built in phases. **All 6 phases (0–5) are complete.**
 
 0. **Foundations** — repo scaffold, canonical schema as Pydantic
    models, network Terraform module + remote state bootstrap, CI,
    local dev via docker-compose. No crawler/parser/API logic yet.
-1. **Crawler** (this phase) — real async fetch logic for `agents.json`
-   and the Web Bot Auth signature-agent-card (JWKS) directory; raw
-   results stored in S3; a `raw-fetched` SQS event per crawled domain;
-   an SQS(`crawl-queue`)-triggered Lambda handler; a seed-list loader
-   script; S3/SQS/Lambda Terraform modules wired into the dev
-   environment. See `services/crawler-service/README.md`. Postgres
-   persistence and `llms.txt`/on-chain-registry signals are not yet in
-   scope -- parser-service (Phase 2) normalizes what's crawled here.
-2. Parser + persistence — normalize raw crawl artifacts into the
-   canonical schema, Postgres schema/migrations, RDS Terraform module.
-3. Public lookup API + frontend — real `api-service` query endpoints
-   and a working lookup UI.
-4. Billing + monitors — API key issuance, plan tiers/rate limiting,
-   webhook notifications.
-5. Production infra + scheduling — full AWS deployment (API Gateway,
-   CloudFront, Amplify, Secrets Manager), scheduled re-crawls,
-   staging/prod environments.
+1. **Crawler** — real async fetch logic for `agents.json` and the Web
+   Bot Auth signature-agent-card (JWKS) directory; raw results stored
+   in S3; a `raw-fetched` SQS event per crawled domain; an
+   SQS(`crawl-queue`)-triggered Lambda handler; a seed-list loader
+   script; S3/SQS/Lambda Terraform modules. See
+   `services/crawler-service/README.md`.
+2. **Parser + persistence** — normalizes raw crawl artifacts into the
+   canonical schema, confidence flags (`expired_key`,
+   `malformed_manifest`, `no_signals`, ...), Postgres schema via
+   Alembic migrations, an Aurora Serverless v2 RDS Terraform module,
+   change detection publishing to `notify-queue`.
+3. **Public lookup API + frontend** — `GET /v1/domains/{domain}` and
+   `/history`, per-IP rate limiting, a working Next.js lookup UI,
+   API Gateway (HTTP API) + Amplify Hosting Terraform modules.
+4. **Billing + auth** — hashed API keys, `POST /v1/domains/bulk`,
+   tiered per-key rate limiting, Stripe Checkout/webhook handling in
+   `billing-service`, an authenticated dashboard.
+5. **Monitoring + licensing + broader coverage** — `notifier-service`
+   (SSRF-safe webhook delivery with retry/backoff), monitor
+   registration with ownership enforcement, `scheduler-service`
+   (tiered re-crawl cadence), `llms.txt` crawling, a documented
+   on-chain-registry stub, and a licensing-only bulk export endpoint.
+
+None of this has been deployed to real AWS — every phase's Terraform
+is written but never `apply`'d (see the Terraform section below). For
+running the whole system locally instead, see the docker-compose
+section below.
 
 ## Running the whole system locally (docker compose)
 
@@ -304,23 +314,36 @@ with an optional dead-letter queue. `lambda` provisions a function (+
 CloudWatch log group) with an optional SQS event source mapping; it
 does not create IAM roles or build/upload deployment packages itself
 -- both are the caller's responsibility, so the module stays reusable.
-The other modules (`rds`, `api_gateway`, `cloudfront`, `amplify`,
-`secrets`) are still placeholders for later phases.
+`rds` provisions an Aurora Serverless v2 Postgres cluster. `dynamodb`
+provisions an on-demand table (used for rate limiting). `api_gateway`
+provisions an HTTP API + Lambda proxy integration + route + throttled
+stage. `secrets` and `amplify` are fleshed out and used by
+billing-service and the frontend respectively. `cloudfront` remains an
+intentional placeholder -- Amplify already fronts the frontend with
+its own CDN, and there's no real domain/ACM cert yet to justify
+putting CloudFront in front of API Gateway.
 
 `infra/terraform/envs/dev/backend-bootstrap` provisions the S3 bucket +
 DynamoDB table used for Terraform remote state (versioned + encrypted
 bucket, pay-per-request lock table). `infra/terraform/envs/dev` wires
-up that backend, calls the `network` module, and (as of Phase 1) calls
-`s3`/`sqs`/`lambda` to provision crawler-service's infrastructure: the
-`agent-intelligence-raw-crawl-dev` bucket, the `crawl-queue` (with DLQ)
-and `raw-fetched` queues, the crawler Lambda triggered off
-`crawl-queue`, and an IAM execution role scoped ONLY to those three
-resources by their specific ARNs (no wildcard resource ARNs) plus its
-own CloudWatch log group. `staging`/`prod` are placeholders that will
-mirror this structure later.
+up that backend, calls the `network` module, and then every other
+module above to provision the full dev environment across all 5
+build phases: crawler-service's bucket/queues/Lambda, parser-service's
+RDS cluster/Lambda/`notify-queue`, api-service's HTTP API/Lambda/rate-limit
+table/export bucket, billing-service's HTTP API/Lambda/Stripe secrets,
+notifier-service's Lambda, and scheduler-service's Lambda + hourly
+EventBridge rule -- each with its own least-privilege IAM role scoped
+to specific resource ARNs (no wildcards) and its own CloudWatch log
+group. `staging`/`prod` are still placeholders that will mirror this
+structure later.
 
-None of this Terraform has been applied — it's written but not
-deployed. The crawler Lambda module call also references a deployment
-package path (`services/crawler-service/dist/crawler-service.zip`)
-that doesn't exist yet; producing it is a build/CI concern for a later
-phase, not part of Phase 1.
+None of this Terraform has ever been `plan`'d or `apply`'d against
+real AWS (the `terraform` CLI isn't installed in the environment this
+was built in) — every module above is written and structurally
+reviewed, but unvalidated against a real provider. Every Lambda module
+call also references a deployment package path (e.g.
+`services/crawler-service/dist/crawler-service.zip`) that doesn't
+exist yet; no build/CI step produces these zips, so a real `apply`
+would fail until packaging is added. See the docker-compose section
+below for how to actually run and test the system locally instead of
+via this Terraform.
