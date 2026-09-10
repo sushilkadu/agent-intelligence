@@ -36,6 +36,266 @@ services:
     volumes:
       - localstack_data:/var/lib/localstack
       - /var/run/docker.sock:/var/run/docker.sock
+    # Added so `depends_on: condition: service_healthy` (used by
+    # localstack-setup and every service that talks to LocalStack
+    # below) is real, not just "the container process started" --
+    # LocalStack's edge service takes a few seconds after container
+    # start before it actually answers S3/SQS/DynamoDB calls.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # --- One-shot: provisions every LocalStack resource the services
+  # below need (S3 buckets, SQS queues + DLQs, the rate-limit DynamoDB
+  # table). Idempotent -- safe to re-run. See infra/localstack/setup.py
+  # for exactly which names it creates and why they were picked (they
+  # mirror the Python services' own config.py defaults, not
+  # Terraform's -- see that script's docstring on the pre-existing
+  # drift between the two).
+  localstack-setup:
+    build:
+      context: ./infra/localstack
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      RAW_DATA_BUCKET_NAME: agent-intel-raw-crawl-dev
+      EXPORT_BUCKET_NAME: agent-intel-exports-dev
+      RATE_LIMIT_TABLE_NAME: agent-intel-dev-rate-limit
+      CRAWL_QUEUE_NAME: crawl-queue
+      CRAWL_QUEUE_DLQ_NAME: crawl-queue-dlq
+      RAW_FETCHED_QUEUE_NAME: raw-fetched
+      NOTIFY_QUEUE_NAME: notify-queue
+      NOTIFY_QUEUE_DLQ_NAME: notify-queue-dlq
+    restart: "no"
+
+  # --- One-shot: runs `alembic upgrade head` (packages/shared-schema)
+  # against postgres. Idempotent -- Alembic no-ops once the DB is
+  # already at head.
+  migrate:
+    build:
+      context: ./packages/shared-schema
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://agent_intel:agent_intel@postgres:5432/agent_intel
+    restart: "no"
+
+  api-service:
+    build:
+      context: .
+      dockerfile: services/api-service/Dockerfile
+    container_name: agent-intel-api-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      localstack-setup:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: agent_intel
+      DB_USER: agent_intel
+      DB_PASSWORD: agent_intel
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      RAW_DATA_BUCKET_NAME: agent-intel-raw-crawl-dev
+      EXPORT_BUCKET_NAME: agent-intel-exports-dev
+      RATE_LIMIT_TABLE_NAME: agent-intel-dev-rate-limit
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  billing-service:
+    build:
+      context: .
+      dockerfile: services/billing-service/Dockerfile
+    container_name: agent-intel-billing-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: agent_intel
+      DB_USER: agent_intel
+      DB_PASSWORD: agent_intel
+      # No real Stripe account/network access exists in this
+      # environment (confirmed in Phase 4's own verification) --
+      # these are harmless local placeholders, matching
+      # billing/config.py's own env-var-driven defaults. Real
+      # Checkout/Portal calls against api.stripe.com will fail
+      # (AuthenticationError et al.) against these; that's expected,
+      # not a bug -- see the README's "Billing / API keys without a
+      # real Stripe account" section for the synthetic-webhook path
+      # that DOES work end to end.
+      STRIPE_SECRET_KEY: sk_test_local_placeholder_not_real
+      STRIPE_WEBHOOK_SECRET: whsec_local_placeholder_not_real
+      FRONTEND_BASE_URL: http://localhost:3000
+      CORS_ALLOWED_ORIGINS: http://localhost:3000
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  crawler-service:
+    build:
+      context: .
+      dockerfile: services/crawler-service/Dockerfile
+    container_name: agent-intel-crawler-service
+    restart: unless-stopped
+    depends_on:
+      localstack:
+        condition: service_healthy
+      localstack-setup:
+        condition: service_completed_successfully
+    environment:
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      RAW_DATA_BUCKET_NAME: agent-intel-raw-crawl-dev
+      CRAWL_QUEUE_URL: http://localstack:4566/000000000000/crawl-queue
+      RAW_FETCHED_QUEUE_URL: http://localstack:4566/000000000000/raw-fetched
+      # Deliberately NOT overriding CRAWLER_URL_SCHEME here -- it
+      # stays at crawler/config.py's real default ("https"). This
+      # compose stack is for genuine manual testing, so domains seeded
+      # via scripts/load_seed_list.py are crawled for real over the
+      # actual internet, not against a local mock server the way the
+      # phase verification scripts do for their own sandboxed runs.
+
+  parser-service:
+    build:
+      context: .
+      dockerfile: services/parser-service/Dockerfile
+    container_name: agent-intel-parser-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      localstack-setup:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: agent_intel
+      DB_USER: agent_intel
+      DB_PASSWORD: agent_intel
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      RAW_DATA_BUCKET_NAME: agent-intel-raw-crawl-dev
+      RAW_FETCHED_QUEUE_URL: http://localstack:4566/000000000000/raw-fetched
+      NOTIFY_QUEUE_URL: http://localstack:4566/000000000000/notify-queue
+
+  notifier-service:
+    build:
+      context: .
+      dockerfile: services/notifier-service/Dockerfile
+    container_name: agent-intel-notifier-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      localstack-setup:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: agent_intel
+      DB_USER: agent_intel
+      DB_PASSWORD: agent_intel
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      NOTIFY_QUEUE_URL: http://localstack:4566/000000000000/notify-queue
+
+  scheduler-service:
+    build:
+      context: .
+      dockerfile: services/scheduler-service/Dockerfile
+    container_name: agent-intel-scheduler-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      localstack-setup:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: agent_intel
+      DB_USER: agent_intel
+      DB_PASSWORD: agent_intel
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      CRAWL_QUEUE_URL: http://localstack:4566/000000000000/crawl-queue
+      # LOCAL-TESTING-ONLY cadence -- the real production deployment
+      # runs this Lambda hourly via EventBridge (see
+      # infra/terraform/envs/dev/main.tf's `scheduler_rule`). 90s here
+      # just makes a scheduler run observable within a short manual
+      # testing session; see scripts/run_periodic.py's docstring.
+      SCHEDULER_INTERVAL_SECONDS: "90"
+
+  frontend:
+    build:
+      context: ./apps/frontend
+    container_name: agent-intel-frontend
+    restart: unless-stopped
+    depends_on:
+      - api-service
+      - billing-service
+    environment:
+      # The browser (not the compose network) makes these requests,
+      # so they must be host-reachable published ports, never internal
+      # service DNS names like http://api-service:8000.
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+      NEXT_PUBLIC_BILLING_BASE_URL: http://localhost:8001
+    ports:
+      - "3000:3000"
 
 volumes:
   postgres_data:
