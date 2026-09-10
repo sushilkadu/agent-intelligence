@@ -330,8 +330,12 @@ module "parser_db" {
   vpc_id     = module.network.vpc_id
   subnet_ids = module.network.private_subnet_ids
 
-  # Only the parser Lambda's own security group may reach Postgres.
-  allowed_security_group_ids = [aws_security_group.parser_lambda.id]
+  # Only these Lambdas' own security groups may reach Postgres.
+  # api-service's Lambda (Phase 3) is a read-only consumer of the same
+  # `domains` table parser-service writes -- added to this list rather
+  # than standing up a second database, since there's exactly one
+  # `domains` table and both services need to reach it.
+  allowed_security_group_ids = [aws_security_group.parser_lambda.id, aws_security_group.api_lambda.id]
 
   min_capacity = 0.5
   max_capacity = 2
@@ -474,4 +478,248 @@ output "parser_db_secret_arn" {
 
 output "parser_lambda_function_name" {
   value = module.parser_lambda.function_name
+}
+
+# ---------------------------------------------------------------------------
+# Phase 3: api-service infrastructure (public API + free lookup frontend)
+# ---------------------------------------------------------------------------
+#
+# api-service is a read-only consumer of two things Phase 1/2 already
+# built: the `domains` table (module.parser_db, above) and the raw
+# crawl S3 bucket (module.raw_crawl_bucket, Phase 1 above). It adds:
+#   * its own Lambda (VPC-placed, same reasoning as parser-service's --
+#     see Phase 2's comment on VPC-vs-RDS-Proxy above), fronted by a
+#     new HTTP API (API Gateway v2).
+#   * a small DynamoDB table backing its per-IP rate limiter (see
+#     services/api-service/api/ratelimit.py).
+#   * Amplify Hosting for apps/frontend, the public lookup page.
+
+variable "github_access_token" {
+  description = "GitHub personal access token (repo scope) for Amplify to pull github.com/sushilkadu/agent-intelligence. Required only to actually `apply` the `frontend_amplify` module -- supply out-of-band (e.g. `TF_VAR_github_access_token`, or a gitignored `*.auto.tfvars`), never hardcoded. See infra/terraform/modules/amplify/main.tf."
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
+locals {
+  api_lambda_name = "agent-intel-dev-api"
+
+  api_tags = {
+    Environment = "dev"
+    Service     = "api-service"
+  }
+}
+
+# --- Rate-limit table (free-tier per-IP counter) ----------------------------
+
+module "rate_limit_table" {
+  source = "../../modules/dynamodb"
+
+  name               = "${local.api_lambda_name}-rate-limit"
+  hash_key           = "id" # "{ip}#{window_start}" -- see api/ratelimit.py
+  ttl_attribute_name = "expires_at"
+
+  tags = local.api_tags
+}
+
+# --- api Lambda's security group --------------------------------------------
+# Same shape as parser_lambda's: no ingress (API Gateway invokes
+# Lambda directly, not over the VPC network path), egress needed to
+# reach Postgres, S3/DynamoDB (via NAT).
+resource "aws_security_group" "api_lambda" {
+  name_prefix = "${local.api_lambda_name}-"
+  description = "api-service Lambda -- outbound only (Postgres, AWS API calls via NAT)."
+  vpc_id      = module.network.vpc_id
+
+  tags = merge(local.api_tags, {
+    Name = "${local.api_lambda_name}-sg"
+  })
+}
+
+resource "aws_security_group_rule" "api_lambda_egress_all" {
+  type              = "egress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = "-1"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.api_lambda.id
+  description       = "All outbound -- Postgres (in-VPC), S3/DynamoDB/Secrets Manager (via NAT)."
+}
+
+# --- IAM: least-privilege api Lambda execution role -------------------------
+#
+# Scoped to exactly what api-service needs: read the DB master-user
+# secret (same secret parser-service's Lambda reads -- both are
+# read/write to the same Postgres cluster, just with different SQL
+# permissions at the DB-user level, which Terraform/IAM has no part
+# in), read-only S3 access to the crawler's raw bucket (never write --
+# crawler-service owns writing to it), read/write on its own rate
+# limit table only (no wildcard resource ARNs anywhere here), plus the
+# standard VPC-attached-Lambda managed policy and its own CloudWatch
+# log group.
+
+data "aws_iam_policy_document" "api_lambda_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "api_lambda" {
+  name               = "${local.api_lambda_name}-role"
+  assume_role_policy = data.aws_iam_policy_document.api_lambda_assume_role.json
+
+  tags = local.api_tags
+}
+
+resource "aws_iam_role_policy_attachment" "api_lambda_vpc_access" {
+  role       = aws_iam_role.api_lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+data "aws_iam_policy_document" "api_lambda_permissions" {
+  statement {
+    sid       = "ReadDbMasterUserSecret"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [module.parser_db.master_user_secret_arn]
+  }
+
+  statement {
+    sid       = "ReadOnlyRawCrawlBucketObjects"
+    actions   = ["s3:GetObject", "s3:ListBucket"]
+    resources = [module.raw_crawl_bucket.bucket_arn, "${module.raw_crawl_bucket.bucket_arn}/*"]
+  }
+
+  statement {
+    sid       = "ReadWriteRateLimitTable"
+    actions   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
+    resources = [module.rate_limit_table.table_arn]
+  }
+
+  statement {
+    sid     = "WriteOwnCloudWatchLogs"
+    actions = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = [
+      "arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.api_lambda_name}:*"
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "api_lambda" {
+  name   = "${local.api_lambda_name}-policy"
+  role   = aws_iam_role.api_lambda.id
+  policy = data.aws_iam_policy_document.api_lambda_permissions.json
+}
+
+# --- api Lambda -------------------------------------------------------------
+
+module "api_lambda" {
+  source = "../../modules/lambda"
+
+  name        = local.api_lambda_name
+  description = "Public read-only lookup API (GET /v1/domains/{domain}, GET /v1/domains/{domain}/history) over the domains table + raw crawl S3 bucket, with a per-IP rate limiter."
+  handler     = "app.handler"
+  runtime     = "python3.11"
+  timeout     = 30
+  memory_size = 256
+  role_arn    = aws_iam_role.api_lambda.arn
+
+  # Same caveat as the crawler/parser Lambdas' `filename`: this
+  # deployment package doesn't exist yet -- produced by a build/CI
+  # step out of scope for this phase. This Terraform is structural,
+  # not applied (no `terraform` CLI is even installed locally).
+  filename = "${path.module}/../../../../services/api-service/dist/api-service.zip"
+
+  vpc_subnet_ids         = module.network.private_subnet_ids
+  vpc_security_group_ids = [aws_security_group.api_lambda.id]
+
+  environment_variables = {
+    RAW_DATA_BUCKET_NAME = module.raw_crawl_bucket.bucket_id
+    RATE_LIMIT_TABLE_NAME = module.rate_limit_table.table_name
+    AWS_REGION             = var.region
+
+    DB_HOST       = module.parser_db.cluster_endpoint
+    DB_PORT       = tostring(module.parser_db.port)
+    DB_NAME       = module.parser_db.database_name
+    DB_USER       = module.parser_db.master_username
+    DB_SECRET_ARN = module.parser_db.master_user_secret_arn
+    # Deliberately no DB_PASSWORD (read from DB_SECRET_ARN at runtime,
+    # see services/api-service/api/db.py) and no AWS_ENDPOINT_URL
+    # (local-dev-only, see services/api-service/api/config.py) -- same
+    # exclusions as parser Lambda's env vars above.
+  }
+
+  # No event_source_arn -- unlike the crawler/parser Lambdas, this
+  # function is invoked by API Gateway (see module.api_gateway below),
+  # not an SQS event source mapping.
+
+  depends_on = [aws_iam_role_policy.api_lambda, aws_iam_role_policy_attachment.api_lambda_vpc_access]
+
+  tags = local.api_tags
+}
+
+# --- HTTP API (API Gateway v2) -----------------------------------------------
+
+module "api_gateway" {
+  source = "../../modules/api_gateway"
+
+  name        = "${local.api_lambda_name}-http"
+  description = "Public lookup API -- GET /v1/domains/{domain}, GET /v1/domains/{domain}/history."
+
+  lambda_invoke_arn     = module.api_lambda.invoke_arn
+  lambda_function_name  = module.api_lambda.function_name
+  routes = [
+    "GET /v1/domains/{domain}",
+    "GET /v1/domains/{domain}/history",
+  ]
+
+  tags = local.api_tags
+}
+
+# --- Frontend (Amplify Hosting) ---------------------------------------------
+#
+# Not applied without a real `github_access_token` supplied out of
+# band -- see the `amplify` module's docstring and the `github_access_token`
+# variable above.
+
+module "frontend_amplify" {
+  source = "../../modules/amplify"
+
+  name                 = "agent-intel-dev-frontend"
+  repository_url       = "https://github.com/sushilkadu/agent-intelligence"
+  github_access_token  = var.github_access_token
+  branch_name          = "main"
+
+  environment_variables = {
+    NEXT_PUBLIC_API_BASE_URL = module.api_gateway.api_endpoint
+  }
+
+  tags = {
+    Environment = "dev"
+    Service     = "frontend"
+  }
+}
+
+output "rate_limit_table_name" {
+  value = module.rate_limit_table.table_name
+}
+
+output "api_lambda_function_name" {
+  value = module.api_lambda.function_name
+}
+
+output "api_gateway_endpoint" {
+  value = module.api_gateway.api_endpoint
+}
+
+output "amplify_app_id" {
+  value = module.frontend_amplify.app_id
+}
+
+output "amplify_default_domain" {
+  value = module.frontend_amplify.default_domain
 }
