@@ -146,6 +146,21 @@ PENDING_CRAWL_TTL_SECONDS = int(os.environ.get("PENDING_CRAWL_TTL_SECONDS", "45"
 # apps/frontend/app/page.tsx).
 CRAWL_POLL_INTERVAL_SECONDS = int(os.environ.get("CRAWL_POLL_INTERVAL_SECONDS", "2"))
 
+# A SEPARATE, tighter per-IP limit specifically on *actually triggering
+# a new crawl* (i.e. only counted against a request that wins
+# `try_acquire_crawl_lock`'s race -- repeatedly polling an
+# already-pending domain never touches this counter, see
+# `_trigger_on_demand_crawl` in api/routes.py). This exists because the
+# general per-IP lookup limit (`RATE_LIMIT_PER_MINUTE`) was never sized
+# with "each request can cause a real outbound HTTP crawl" in mind --
+# an attacker could stay comfortably under that general limit while
+# still enumerating many distinct never-seen domains to force a lot of
+# real crawls, since a *lookup* and a *crawl-triggering lookup* were
+# priced the same. A much smaller allowance over a longer window
+# reflects that triggering new crawls is the more expensive action.
+CRAWL_TRIGGER_RATE_LIMIT = int(os.environ.get("CRAWL_TRIGGER_RATE_LIMIT", "5"))
+CRAWL_TRIGGER_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("CRAWL_TRIGGER_RATE_LIMIT_WINDOW_SECONDS", "600"))
+
 # --- Licensing-only bulk export (Phase 5) -----------------------------------
 #
 # Only `licensing`-tier keys may dump the full `domains` table --
@@ -175,6 +190,8 @@ __all__ = [
     "BULK_MAX_DOMAINS",
     "CRAWL_POLL_INTERVAL_SECONDS",
     "CRAWL_QUEUE_URL",
+    "CRAWL_TRIGGER_RATE_LIMIT",
+    "CRAWL_TRIGGER_RATE_LIMIT_WINDOW_SECONDS",
     "DB_HOST",
     "DB_NAME",
     "DB_PASSWORD",

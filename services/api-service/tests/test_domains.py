@@ -227,3 +227,94 @@ def test_private_ip_as_domain_is_rejected(client_no_rate_limit, monkeypatch):
 
     assert response.status_code == 400
     assert response.json()["error"] == "unsafe_domain"
+
+
+# --- cache miss: the SEPARATE, tighter crawl-triggering rate limit -----------
+#
+# Distinct from `enforce_rate_limit`'s general per-IP lookup limit
+# (bypassed here via `client_no_rate_limit`): this is
+# `CRAWL_TRIGGER_RATE_LIMIT`, only ever consumed by a request that
+# WINS `try_acquire_crawl_lock`'s race (see `_trigger_on_demand_crawl`'s
+# docstring). FastAPI's TestClient reports a fixed `request.client.host`
+# ("testclient") for every request in these tests, which is exactly what
+# lets a single test simulate "many requests from the same IP."
+
+
+@mock_aws
+def test_exceeding_the_crawl_trigger_limit_returns_429_and_releases_the_lock(client_no_rate_limit, monkeypatch):
+    monkeypatch.setattr(routes, "fetch_domain", lambda _conn, _domain: None)
+    monkeypatch.setattr(routes, "RATE_LIMIT_TABLE_NAME", RATE_LIMIT_TABLE)
+    monkeypatch.setattr(routes, "CRAWL_TRIGGER_RATE_LIMIT", 2)
+    dynamodb = boto3.client("dynamodb", region_name="us-east-1")
+    _create_rate_limit_table(dynamodb)
+
+    sqs = boto3.client("sqs", region_name="us-east-1")
+    queue_url = sqs.create_queue(QueueName="crawl-queue-test")["QueueUrl"]
+    monkeypatch.setattr(routes, "CRAWL_QUEUE_URL", queue_url)
+
+    _mock_safe_dns(monkeypatch)
+
+    # Two distinct never-seen domains: each one WINS its own
+    # try_acquire_crawl_lock race and so each consumes one unit of this
+    # IP's crawl-trigger budget (limit=2 above).
+    first = client_no_rate_limit.get("/v1/domains/budget-one.example")
+    second = client_no_rate_limit.get("/v1/domains/budget-two.example")
+    assert first.status_code == 202
+    assert second.status_code == 202
+
+    # A third, also-never-seen domain: still wins the lock race (it's a
+    # brand new domain), but this IP is now over its separate
+    # crawl-trigger limit -> 429, and NO crawl-queue message for it.
+    third = client_no_rate_limit.get("/v1/domains/budget-three.example")
+    assert third.status_code == 429
+    assert third.json()["error"] == "rate_limit_exceeded"
+
+    messages = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10).get("Messages", [])
+    domains_enqueued = {json.loads(m["Body"])["domain"] for m in messages}
+    assert domains_enqueued == {"budget-one.example", "budget-two.example"}
+
+    # The lock this rejected request itself acquired must have been
+    # released -- otherwise budget-three.example would be falsely stuck
+    # "pending" (for every IP, not just this rate-limited one) until
+    # PENDING_CRAWL_TTL_SECONDS expires, per release_crawl_lock's
+    # docstring.
+    item = dynamodb.get_item(TableName=RATE_LIMIT_TABLE, Key={"id": {"S": "pending-crawl#budget-three.example"}})
+    assert "Item" not in item
+
+
+@mock_aws
+def test_polling_an_already_pending_domain_never_consumes_the_crawl_trigger_budget(client_no_rate_limit, monkeypatch):
+    """The critical property this design depends on: the frontend polls
+    `GET /v1/domains/{domain}` every ~2s while a crawl is pending (see
+    apps/frontend/app/page.tsx) -- if each of THOSE polls also counted
+    against CRAWL_TRIGGER_RATE_LIMIT, a single real user's own normal
+    polling would exhaust their budget and produce a false 429 before
+    their own crawl even finishes.
+    """
+    monkeypatch.setattr(routes, "fetch_domain", lambda _conn, _domain: None)
+    monkeypatch.setattr(routes, "RATE_LIMIT_TABLE_NAME", RATE_LIMIT_TABLE)
+    monkeypatch.setattr(routes, "CRAWL_TRIGGER_RATE_LIMIT", 1)
+    _create_rate_limit_table(boto3.client("dynamodb", region_name="us-east-1"))
+
+    sqs = boto3.client("sqs", region_name="us-east-1")
+    queue_url = sqs.create_queue(QueueName="crawl-queue-test")["QueueUrl"]
+    monkeypatch.setattr(routes, "CRAWL_QUEUE_URL", queue_url)
+
+    _mock_safe_dns(monkeypatch)
+
+    # First request wins the lock and consumes this IP's entire
+    # crawl-trigger budget (limit=1 above).
+    first = client_no_rate_limit.get("/v1/domains/still-pending.example")
+    assert first.status_code == 202
+
+    # Many subsequent polls of the SAME still-pending domain: none of
+    # these should be rejected, even though the budget is already
+    # exhausted -- they never reach the rate-limit check at all, since
+    # try_acquire_crawl_lock reports "already in flight" for each one.
+    for _ in range(5):
+        poll = client_no_rate_limit.get("/v1/domains/still-pending.example")
+        assert poll.status_code == 202
+        assert poll.json()["status"] == "pending"
+
+    messages = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10).get("Messages", [])
+    assert len(messages) == 1

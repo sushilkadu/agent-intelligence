@@ -42,6 +42,8 @@ from .config import (
     BULK_ALLOWED_PLAN_TIERS,
     CRAWL_POLL_INTERVAL_SECONDS,
     CRAWL_QUEUE_URL,
+    CRAWL_TRIGGER_RATE_LIMIT,
+    CRAWL_TRIGGER_RATE_LIMIT_WINDOW_SECONDS,
     EXPORT_ALLOWED_PLAN_TIERS,
     HISTORY_DEFAULT_LIMIT,
     HISTORY_MAX_LIMIT,
@@ -52,7 +54,7 @@ from .config import (
     RATE_LIMIT_WINDOW_SECONDS,
     RAW_DATA_BUCKET_NAME,
 )
-from .crawl_trigger import enqueue_crawl, get_crawl_sqs_client, try_acquire_crawl_lock
+from .crawl_trigger import enqueue_crawl, get_crawl_sqs_client, release_crawl_lock, try_acquire_crawl_lock
 from .db import (
     delete_monitor,
     fetch_all_domains,
@@ -67,6 +69,7 @@ from .history import get_s3_client, list_domain_history
 from .ratelimit import (
     build_rate_limited_error,
     check_and_increment,
+    check_and_increment_for_crawl_trigger,
     check_and_increment_for_key,
     get_current_window_count,
     get_dynamodb_client,
@@ -243,7 +246,7 @@ def enforce_bulk_rate_limit(context: ApiKeyContext = Depends(require_bulk_api_ke
     summary="Look up a domain's agent-identity signals",
     dependencies=[Depends(enforce_rate_limit)],
 )
-def get_domain(domain: str, conn=Depends(_get_db_connection)) -> Any:  # noqa: B008 (standard FastAPI DI idiom)
+def get_domain(request: Request, domain: str, conn=Depends(_get_db_connection)) -> Any:  # noqa: B008 (standard FastAPI DI idiom)
     """Return the current normalized record for `domain`.
 
     On a cache miss (never crawled, or a previous crawl hasn't landed
@@ -251,19 +254,20 @@ def get_domain(domain: str, conn=Depends(_get_db_connection)) -> Any:  # noqa: B
     on-demand crawl and returns 202 telling the caller to check back
     shortly -- see `_trigger_on_demand_crawl`'s docstring for the full
     flow (SSRF validation, crawl-queue enqueue, duplicate-crawl
-    suppression). A domain that fails the SSRF safety check is a clean
-    400, not a 404 and not a 500.
+    suppression, and its own separate rate limit). A domain that fails
+    the SSRF safety check is a clean 400, not a 404 and not a 500.
     """
     row = fetch_domain(conn, domain)
     if row is None:
-        return _trigger_on_demand_crawl(domain)
+        client_ip = request.client.host if request.client else "unknown"
+        return _trigger_on_demand_crawl(domain, client_ip)
     # See api/schemas.py's docstring: the response shape is exactly
     # the canonical `Domain` model's fields, which is exactly what
     # `fetch_domain`'s RealDictCursor row already looks like.
     return row
 
 
-def _trigger_on_demand_crawl(domain: str) -> JSONResponse:
+def _trigger_on_demand_crawl(domain: str, client_ip: str) -> JSONResponse:
     """Handle a `GET /v1/domains/{domain}` cache miss: validate, then
     trigger (or confirm already-in-flight) a real crawl of `domain`.
 
@@ -286,7 +290,17 @@ def _trigger_on_demand_crawl(domain: str) -> JSONResponse:
     domain (two tabs, a retry, concurrent visitors) enqueue at most ONE
     crawl -- a second request within `PENDING_CRAWL_TTL_SECONDS` sees
     "already in progress" and gets the exact same 202 response without
-    enqueuing anything itself.
+    touching anything below.
+
+    Only the request that actually WINS that race then gets checked
+    against `CRAWL_TRIGGER_RATE_LIMIT` -- a separate, much tighter
+    per-IP limit than the general lookup rate (`enforce_rate_limit`),
+    since this is the action that costs a real outbound crawl, not a
+    Postgres read. If this IP is over ITS crawl-triggering budget, the
+    lock this request just acquired is released (see
+    `release_crawl_lock`'s docstring for why: leaving it in place would
+    falsely block every OTHER caller from triggering this domain too)
+    and the caller gets a 429, not a 202 -- no crawl is enqueued.
     """
     try:
         validate_crawl_domain(domain)
@@ -307,6 +321,24 @@ def _trigger_on_demand_crawl(domain: str) -> JSONResponse:
         ttl_seconds=PENDING_CRAWL_TTL_SECONDS,
     )
     if acquired:
+        allowed, _count = check_and_increment_for_crawl_trigger(
+            dynamodb_client,
+            RATE_LIMIT_TABLE_NAME,
+            client_ip,
+            limit=CRAWL_TRIGGER_RATE_LIMIT,
+            window_seconds=CRAWL_TRIGGER_RATE_LIMIT_WINDOW_SECONDS,
+        )
+        if not allowed:
+            release_crawl_lock(dynamodb_client, RATE_LIMIT_TABLE_NAME, domain)
+            logger.info("on-demand crawl trigger for %s rejected: %s is over its trigger rate limit", domain, client_ip)
+            raise HTTPException(
+                status_code=429,
+                detail=build_rate_limited_error(
+                    limit=CRAWL_TRIGGER_RATE_LIMIT,
+                    window_seconds=CRAWL_TRIGGER_RATE_LIMIT_WINDOW_SECONDS,
+                    tier="crawl-trigger",
+                ),
+            )
         sqs_client = get_crawl_sqs_client()
         enqueue_crawl(sqs_client, CRAWL_QUEUE_URL, domain)
         logger.info("triggered on-demand crawl for %s", domain)

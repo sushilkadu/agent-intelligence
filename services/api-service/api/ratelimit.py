@@ -176,6 +176,47 @@ def check_and_increment_for_key(
     )
 
 
+# --- On-demand crawl triggering: a separate, tighter limit -----------------
+#
+# Same reuse-not-reimplement approach as `check_and_increment_for_key`
+# above: a distinct `crawl-trigger:` subject prefix keeps this counter's
+# DynamoDB items from ever colliding with a plain IP lookup window, an
+# authenticated key's window, or `api/crawl_trigger.py`'s own
+# `pending-crawl#{domain}` markers. See api/config.py's
+# `CRAWL_TRIGGER_RATE_LIMIT`/`_WINDOW_SECONDS` for why this exists and
+# is deliberately tighter than the general per-IP lookup limit -- and
+# `api/routes.py`'s `_trigger_on_demand_crawl` for why this is only
+# ever checked for the request that actually WINS
+# `try_acquire_crawl_lock`'s race, never for a request that finds a
+# crawl already pending.
+def _crawl_trigger_item_subject(ip: str) -> str:
+    return f"crawl-trigger:{ip}"
+
+
+def check_and_increment_for_crawl_trigger(
+    client,
+    table_name: str,
+    ip: str,
+    *,
+    limit: int,
+    window_seconds: int,
+    now: float | None = None,
+) -> tuple[bool, int]:
+    """Same fixed-window counter as `check_and_increment`, keyed by the
+    caller's IP under the `crawl-trigger:` subject prefix and enforced
+    against the separate, tighter crawl-triggering limit rather than
+    the general per-IP lookup rate.
+    """
+    return check_and_increment(
+        client,
+        table_name,
+        _crawl_trigger_item_subject(ip),
+        limit=limit,
+        window_seconds=window_seconds,
+        now=now,
+    )
+
+
 def get_current_window_count(
     client,
     table_name: str,
@@ -202,6 +243,7 @@ def get_current_window_count(
 __all__ = [
     "build_rate_limited_error",
     "check_and_increment",
+    "check_and_increment_for_crawl_trigger",
     "check_and_increment_for_key",
     "get_current_window_count",
     "get_dynamodb_client",

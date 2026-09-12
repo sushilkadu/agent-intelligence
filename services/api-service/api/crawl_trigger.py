@@ -115,4 +115,27 @@ def try_acquire_crawl_lock(
         return False
 
 
-__all__ = ["enqueue_crawl", "get_crawl_sqs_client", "try_acquire_crawl_lock"]
+def release_crawl_lock(dynamodb_client, table_name: str, domain: str) -> None:
+    """Release a lock this same request just acquired via
+    `try_acquire_crawl_lock`, WITHOUT enqueuing a crawl.
+
+    The only caller is `api/routes.py`'s `_trigger_on_demand_crawl`,
+    for exactly one case: this request won the race to trigger a new
+    crawl, but then failed the separate, tighter crawl-triggering rate
+    limit (see `api/ratelimit.py`'s `check_and_increment_for_crawl_trigger`)
+    -- so no crawl was actually enqueued. Leaving the marker in place
+    would falsely tell every OTHER caller (any IP, not just this
+    rate-limited one) "a crawl for this domain is already in flight"
+    for the rest of `PENDING_CRAWL_TTL_SECONDS`, blocking a legitimate
+    request from a different, well-behaved visitor for no real reason.
+    A plain `DeleteItem` (not conditional) is correct here: this
+    request is the one that just wrote the marker, so deleting it
+    unconditionally simply undoes that write.
+    """
+    dynamodb_client.delete_item(
+        TableName=table_name,
+        Key={"id": {"S": _pending_crawl_item_id(domain)}},
+    )
+
+
+__all__ = ["enqueue_crawl", "get_crawl_sqs_client", "release_crawl_lock", "try_acquire_crawl_lock"]
