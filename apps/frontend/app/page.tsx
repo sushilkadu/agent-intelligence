@@ -366,12 +366,39 @@ function PendingCrawl({ domain }: { domain: string }) {
   );
 }
 
+// Confidence flags that are folded directly into their own signal's row
+// below (see `agentsJsonLine`/`webBotAuthLine`) instead of also being
+// repeated in the generic flags list -- showing BOTH a green "found."
+// row and a separate "couldn't be parsed" banner for the exact same
+// signal read as self-contradictory (this is the bug a real user
+// caught: "agents.json found. ✅" right above "This domain's
+// agents.json couldn't be parsed." ⚠️ for the same lookup). Each row
+// now tells its own complete story; the flags list below only ever
+// shows what isn't already said above (e.g. `no_signals`, or any new
+// flag added later that doesn't have dedicated row treatment yet).
+const FLAGS_SHOWN_INLINE_IN_A_ROW = new Set(["malformed_manifest", "malformed_web_bot_auth", "expired_key"]);
+
 function FoundResult({ record }: { record: DomainRecord }) {
+  const manifestMalformed = record.confidence_flags.includes("malformed_manifest");
+  const webBotAuthMalformed = record.confidence_flags.includes("malformed_web_bot_auth");
+
+  const agentsJsonOk = record.agent_json_present && !manifestMalformed;
+  const agentsJsonLine = !record.agent_json_present
+    ? "No agents.json found."
+    : manifestMalformed
+      ? "agents.json found, but it couldn't be parsed."
+      : "agents.json found.";
+
+  const webBotAuthOk = record.web_bot_auth_present && !webBotAuthMalformed && record.web_bot_auth_valid;
   const webBotAuthLine = !record.web_bot_auth_present
     ? "No Web Bot Auth directory found."
-    : record.web_bot_auth_valid
-      ? "Web Bot Auth found, with a currently valid signing key."
-      : "Web Bot Auth found, but its signing key is not currently valid.";
+    : webBotAuthMalformed
+      ? "Web Bot Auth directory found, but it couldn't be parsed."
+      : record.web_bot_auth_valid
+        ? "Web Bot Auth found, with a currently valid signing key."
+        : "Web Bot Auth found, but its signing key is not currently valid.";
+
+  const remainingFlags = record.confidence_flags.filter((flag) => !FLAGS_SHOWN_INLINE_IN_A_ROW.has(flag));
 
   return (
     <div className="flex flex-col gap-4">
@@ -380,20 +407,16 @@ function FoundResult({ record }: { record: DomainRecord }) {
       </p>
 
       <ul className="flex flex-col gap-2">
-        <ResultRow ok={record.agent_json_present}>
-          {record.agent_json_present ? "agents.json found." : "No agents.json found."}
-        </ResultRow>
+        <ResultRow ok={agentsJsonOk}>{agentsJsonLine}</ResultRow>
         <ResultRow ok={record.llms_txt_present}>
           {record.llms_txt_present ? "llms.txt found." : "No llms.txt found."}
         </ResultRow>
-        <ResultRow ok={record.web_bot_auth_present && record.web_bot_auth_valid}>
-          {webBotAuthLine}
-        </ResultRow>
+        <ResultRow ok={webBotAuthOk}>{webBotAuthLine}</ResultRow>
       </ul>
 
-      {record.confidence_flags.length > 0 && (
+      {remainingFlags.length > 0 && (
         <div className="flex flex-col gap-1 rounded-md bg-amber-50 p-3 text-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
-          {record.confidence_flags.map((flag) => (
+          {remainingFlags.map((flag) => (
             <p key={flag}>{describeConfidenceFlag(flag)}</p>
           ))}
         </div>
