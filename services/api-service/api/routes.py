@@ -11,30 +11,48 @@ Phase 3's original behavior, unchanged. See `api/auth.py` and
 
 `POST /v1/domains/bulk` and `GET /v1/keys/me` are new Phase 4 routes
 that always require a valid API key (see their own dependencies below).
+
+`GET /v1/domains/{domain}` no longer dead-ends on a cache miss with a
+404 -- it triggers a real on-demand crawl and returns 202 instead (see
+`_trigger_on_demand_crawl` and `api/crawl_trigger.py`). `POST
+/v1/domains/bulk` is unaffected by this: it still reports per-domain
+`found=False` for anything not already crawled, exactly as before.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 import psycopg2
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from shared_utils import UnsafeWebhookURLError, validate_webhook_url
+from fastapi.responses import JSONResponse
+from shared_utils import (
+    UnsafeCrawlDomainError,
+    UnsafeWebhookURLError,
+    get_logger,
+    validate_crawl_domain,
+    validate_webhook_url,
+)
 
 from .auth import ApiKeyContext, authenticate, lookup_api_key_context
 from .config import (
     API_KEY_HEADER,
     BULK_ALLOWED_PLAN_TIERS,
+    CRAWL_POLL_INTERVAL_SECONDS,
+    CRAWL_QUEUE_URL,
     EXPORT_ALLOWED_PLAN_TIERS,
     HISTORY_DEFAULT_LIMIT,
     HISTORY_MAX_LIMIT,
     MONITOR_ALLOWED_PLAN_TIERS,
+    PENDING_CRAWL_TTL_SECONDS,
     RATE_LIMIT_PER_MINUTE,
     RATE_LIMIT_TABLE_NAME,
     RATE_LIMIT_WINDOW_SECONDS,
     RAW_DATA_BUCKET_NAME,
 )
+from .crawl_trigger import enqueue_crawl, get_crawl_sqs_client, try_acquire_crawl_lock
 from .db import (
     delete_monitor,
     fetch_all_domains,
@@ -65,6 +83,8 @@ from .schemas import (
 )
 
 router = APIRouter()
+
+logger = get_logger("api-service")
 
 
 def _get_db_connection():
@@ -223,26 +243,85 @@ def enforce_bulk_rate_limit(context: ApiKeyContext = Depends(require_bulk_api_ke
     summary="Look up a domain's agent-identity signals",
     dependencies=[Depends(enforce_rate_limit)],
 )
-def get_domain(domain: str, conn=Depends(_get_db_connection)) -> dict:  # noqa: B008 (standard FastAPI DI idiom)
+def get_domain(domain: str, conn=Depends(_get_db_connection)) -> Any:  # noqa: B008 (standard FastAPI DI idiom)
     """Return the current normalized record for `domain`.
 
-    404 (not 500) when the domain has never been crawled -- that's an
-    expected, common outcome for a public lookup tool, not a server
-    error.
+    On a cache miss (never crawled, or a previous crawl hasn't landed
+    yet), this no longer dead-ends with a 404: it triggers a real
+    on-demand crawl and returns 202 telling the caller to check back
+    shortly -- see `_trigger_on_demand_crawl`'s docstring for the full
+    flow (SSRF validation, crawl-queue enqueue, duplicate-crawl
+    suppression). A domain that fails the SSRF safety check is a clean
+    400, not a 404 and not a 500.
     """
     row = fetch_domain(conn, domain)
     if row is None:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error": "domain_not_found",
-                "message": f"'{domain}' has not been crawled yet.",
-            },
-        )
+        return _trigger_on_demand_crawl(domain)
     # See api/schemas.py's docstring: the response shape is exactly
     # the canonical `Domain` model's fields, which is exactly what
     # `fetch_domain`'s RealDictCursor row already looks like.
     return row
+
+
+def _trigger_on_demand_crawl(domain: str) -> JSONResponse:
+    """Handle a `GET /v1/domains/{domain}` cache miss: validate, then
+    trigger (or confirm already-in-flight) a real crawl of `domain`.
+
+    Allowing anonymous, arbitrary user-typed input to directly cause
+    this product's own infrastructure (crawler-service, inside our
+    VPC) to make an outbound HTTP request to that input is an SSRF
+    vector structurally identical to the webhook-URL SSRF issue already
+    closed for `POST /v1/monitors` (see
+    `shared_utils.webhook_safety.validate_webhook_url`) -- a malicious
+    visitor could type `169.254.169.254` (the cloud metadata address),
+    `localhost`, or an internal hostname into the public search box.
+    `validate_crawl_domain` runs the SAME resolve-then-classify check,
+    applied to a bare domain instead of a full URL, BEFORE anything is
+    enqueued. A domain that fails it gets a clean, honest, but
+    deliberately generic 400 -- "can't be checked," never a message
+    that confirms or denies internal network topology to an attacker.
+
+    Once a domain passes that check, `try_acquire_crawl_lock` makes
+    sure two near-simultaneous lookups for the same not-yet-crawled
+    domain (two tabs, a retry, concurrent visitors) enqueue at most ONE
+    crawl -- a second request within `PENDING_CRAWL_TTL_SECONDS` sees
+    "already in progress" and gets the exact same 202 response without
+    enqueuing anything itself.
+    """
+    try:
+        validate_crawl_domain(domain)
+    except UnsafeCrawlDomainError:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "unsafe_domain",
+                "message": f"'{domain}' can't be checked.",
+            },
+        ) from None
+
+    dynamodb_client = get_dynamodb_client()
+    acquired = try_acquire_crawl_lock(
+        dynamodb_client,
+        RATE_LIMIT_TABLE_NAME,
+        domain,
+        ttl_seconds=PENDING_CRAWL_TTL_SECONDS,
+    )
+    if acquired:
+        sqs_client = get_crawl_sqs_client()
+        enqueue_crawl(sqs_client, CRAWL_QUEUE_URL, domain)
+        logger.info("triggered on-demand crawl for %s", domain)
+    else:
+        logger.info("on-demand crawl for %s already in flight, not re-enqueuing", domain)
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "domain": domain,
+            "status": "pending",
+            "message": f"'{domain}' hasn't been crawled yet -- a crawl was just triggered. Check back in a few seconds.",
+            "retry_after_seconds": CRAWL_POLL_INTERVAL_SECONDS,
+        },
+    )
 
 
 @router.get(

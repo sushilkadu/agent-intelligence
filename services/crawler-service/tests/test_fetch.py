@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import httpx
 import respx
@@ -261,6 +262,42 @@ def test_crawl_domain_unreachable_for_all_signals():
     assert result.web_bot_auth.error is not None
     assert result.llms_txt.present is False
     assert result.llms_txt.error is not None
+
+
+@respx.mock
+def test_crawl_domain_runs_its_three_fetches_concurrently_not_sequentially():
+    """The specific behavior this on-demand-crawl-latency change is for:
+    a real waiting user's worst-case wait must be roughly ONE fetch's
+    delay, not the sum of all three -- see fetch.py's `crawl_domain`
+    docstring. Each mocked endpoint sleeps for `DELAY_SECONDS`; if the
+    three awaits were still sequential (the old behavior) this would
+    take >= 3 * DELAY_SECONDS. Run concurrently via `asyncio.gather`,
+    it should take roughly one DELAY_SECONDS, comfortably under the
+    2x-single-delay threshold this test asserts.
+    """
+    DELAY_SECONDS = 0.3
+
+    async def _slow_200(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(DELAY_SECONDS)
+        return httpx.Response(200, content=b"ok")
+
+    respx.get(AGENTS_JSON_URL).mock(side_effect=_slow_200)
+    respx.get(WEB_BOT_AUTH_URL).mock(side_effect=_slow_200)
+    respx.get(LLMS_TXT_URL).mock(side_effect=_slow_200)
+
+    started_at = time.monotonic()
+    result = run(crawl_domain(DOMAIN))
+    elapsed = time.monotonic() - started_at
+
+    assert result.agents_json.present is True
+    assert result.web_bot_auth.present is True
+    assert result.llms_txt.present is True
+    # Sequential would be >= 3 * DELAY_SECONDS (~0.9s); concurrent stays
+    # well under 2 * DELAY_SECONDS even with scheduling overhead.
+    assert elapsed < DELAY_SECONDS * 2, (
+        f"expected the three fetches to run concurrently (~{DELAY_SECONDS}s), took {elapsed:.3f}s -- "
+        "looks sequential"
+    )
 
 
 @respx.mock

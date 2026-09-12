@@ -16,14 +16,21 @@ from .api_keys import (
     hash_api_key_secret,
 )
 from .logging import get_logger
-from .webhook_safety import UnsafeWebhookURLError, validate_webhook_url
+from .webhook_safety import (
+    UnsafeCrawlDomainError,
+    UnsafeWebhookURLError,
+    validate_crawl_domain,
+    validate_webhook_url,
+)
 
 __all__ = [
     "API_KEY_HEADER",
     "API_KEY_PREFIX",
+    "UnsafeCrawlDomainError",
     "UnsafeWebhookURLError",
     "generate_api_key_secret",
     "get_logger",
     "hash_api_key_secret",
+    "validate_crawl_domain",
     "validate_webhook_url",
 ]

@@ -592,9 +592,10 @@ resource "aws_security_group_rule" "api_lambda_egress_all" {
 # permissions at the DB-user level, which Terraform/IAM has no part
 # in), read-only S3 access to the crawler's raw bucket (never write --
 # crawler-service owns writing to it), read/write on its own rate
-# limit table only (no wildcard resource ARNs anywhere here), plus the
-# standard VPC-attached-Lambda managed policy and its own CloudWatch
-# log group.
+# limit table only, SendMessage-only (never Receive/Delete) onto
+# crawl-queue for on-demand crawl triggering (no wildcard resource ARNs
+# anywhere here), plus the standard VPC-attached-Lambda managed policy
+# and its own CloudWatch log group.
 
 data "aws_iam_policy_document" "api_lambda_assume_role" {
   statement {
@@ -638,6 +639,20 @@ data "aws_iam_policy_document" "api_lambda_permissions" {
     resources = [module.rate_limit_table.table_arn]
   }
 
+  # On-demand crawl triggering: GET /v1/domains/{domain}'s cache-miss
+  # path enqueues a real crawl onto the SAME crawl-queue
+  # crawler-service consumes from and scheduler-service already
+  # publishes to (see api/crawl_trigger.py, api/config.py's
+  # `CRAWL_QUEUE_URL`). Scoped to exactly this one action on exactly
+  # this one queue -- SendMessage only, no ReceiveMessage/DeleteMessage
+  # (api-service is a producer here, never a consumer of this queue;
+  # crawler_lambda's own role above already holds those).
+  statement {
+    sid       = "SendOnDemandCrawlToCrawlQueue"
+    actions   = ["sqs:SendMessage"]
+    resources = [module.crawl_queue.queue_arn]
+  }
+
   # Phase 5: POST /v1/export writes the NDJSON dump and then generates
   # a presigned GET for it -- both PutObject (the write) and GetObject
   # (S3 checks the CALLING IDENTITY's own permissions when a presigned
@@ -674,7 +689,7 @@ module "api_lambda" {
   source = "../../modules/lambda"
 
   name        = local.api_lambda_name
-  description = "Public read-only lookup API (GET /v1/domains/{domain}, GET /v1/domains/{domain}/history) over the domains table + raw crawl S3 bucket, with a per-IP rate limiter."
+  description = "Public lookup API (GET /v1/domains/{domain}, GET /v1/domains/{domain}/history) over the domains table + raw crawl S3 bucket, with a per-IP rate limiter; a cache miss on GET /v1/domains/{domain} enqueues a real on-demand crawl (SendMessage-only onto crawl-queue) rather than only reading."
   handler     = "app.handler"
   runtime     = "python3.11"
   timeout     = 30
@@ -697,6 +712,13 @@ module "api_lambda" {
 
     # Phase 5: POST /v1/export's destination bucket.
     EXPORT_BUCKET_NAME = module.export_bucket.bucket_id
+
+    # On-demand crawl triggering (GET /v1/domains/{domain} cache miss)
+    # -- the SAME crawl-queue Phase 1's crawler Lambda already consumes
+    # from and scheduler-service already publishes to (see
+    # `aws_iam_role_policy.api_lambda`'s `SendOnDemandCrawlToCrawlQueue`
+    # statement above for the matching least-privilege grant).
+    CRAWL_QUEUE_URL = module.crawl_queue.queue_id
 
     DB_HOST       = module.parser_db.cluster_endpoint
     DB_PORT       = tostring(module.parser_db.port)

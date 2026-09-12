@@ -1,4 +1,5 @@
-"""SSRF-safe validation for customer-supplied webhook URLs.
+"""SSRF-safe validation for customer-supplied webhook URLs, and for
+anonymous, user-typed domain names about to trigger a real crawl.
 
 Shared between api-service (validates `webhook_url` once, at
 `POST /v1/monitors` registration time) and notifier-service (re-validates
@@ -8,6 +9,23 @@ helpers in this codebase that lives in `shared-utils` rather than being
 copy-pasted per-service, because the two call sites MUST agree on
 exactly what "safe" means or one of them becomes a false sense of
 security.
+
+--- On-demand crawl triggering adds a SECOND, structurally identical
+    SSRF vector ------------------------------------------------------
+
+`GET /v1/domains/{domain}` (api-service) triggers a real, on-demand
+crawl of `domain` the first time anyone looks it up (see
+`api/routes.py`'s `_trigger_on_demand_crawl`). That means anonymous,
+unauthenticated, user-typed input now directly causes crawler-service
+(running inside our own VPC) to make an outbound HTTP request to
+whatever string was typed into the public search box -- e.g.
+`169.254.169.254` (the cloud metadata address) or `localhost`. This is
+the exact same shape of problem `validate_webhook_url` below already
+solves for registered webhook URLs, just with a bare domain instead of
+a full `https://` URL and no scheme to anchor on. `validate_crawl_domain`
+reuses the SAME resolution + IP-classification logic (`_default_resolve`,
+`_is_unsafe_ip`) rather than re-deriving a second definition of "safe"
+that could quietly drift from this one.
 
 --- Why this exists ---------------------------------------------------
 
@@ -134,4 +152,89 @@ def validate_webhook_url(url: str, *, resolver: Callable[[str], list[str]] | Non
             )
 
 
-__all__ = ["UnsafeWebhookURLError", "validate_webhook_url"]
+class UnsafeCrawlDomainError(ValueError):
+    """Raised when a bare domain fails the safety checks below. Callers
+    (api-service's `GET /v1/domains/{domain}` cache-miss path) turn this
+    into a clean, generic 4xx -- never a 500, and never a message that
+    confirms or denies WHY the domain was rejected (see
+    `validate_crawl_domain`'s docstring).
+    """
+
+
+def _reject_non_bare_domain(domain: str) -> None:
+    """Reject anything that isn't plausibly a bare hostname before it
+    ever reaches DNS resolution -- a scheme, path, userinfo, or
+    whitespace has no business in a "domain" field and `urlparse`-ing a
+    bare string like `example.com` wouldn't reliably extract a hostname
+    from it anyway (unlike `validate_webhook_url`, which parses a real
+    `https://...` URL). This is a shape check, not the safety check
+    itself -- `_default_resolve` + `_is_unsafe_ip` below are what
+    actually decide "safe."
+    """
+    stripped = domain.strip()
+    if not stripped:
+        raise UnsafeCrawlDomainError("domain must not be empty")
+    if stripped != domain:
+        raise UnsafeCrawlDomainError("domain must not have leading/trailing whitespace")
+    if any(char.isspace() for char in stripped):
+        raise UnsafeCrawlDomainError("domain must not contain whitespace")
+    if "://" in stripped or "/" in stripped or "@" in stripped:
+        raise UnsafeCrawlDomainError("domain must be a bare hostname, not a URL")
+
+
+def validate_crawl_domain(domain: str, *, resolver: Callable[[str], list[str]] | None = None) -> None:
+    """Raise `UnsafeCrawlDomainError` if `domain` is not safe for this
+    product's own infrastructure (crawler-service) to make a real
+    outbound HTTP request to on an anonymous visitor's say-so.
+
+    Sibling to `validate_webhook_url` above, applied to a bare hostname
+    (e.g. `example.com`) instead of a full `https://` URL -- same
+    resolve-then-classify-every-address approach (`_default_resolve`,
+    `_is_unsafe_ip`), so a domain that resolves to a private/loopback/
+    link-local (including the cloud metadata address)/multicast/
+    reserved/unspecified address is rejected exactly the same way a
+    webhook URL resolving there would be. A bare IP literal typed
+    directly as the "domain" (e.g. `169.254.169.254`) is caught the
+    same way: resolving an IP literal just returns that literal address,
+    which then fails the same `_is_unsafe_ip` check.
+
+    Same documented residual risk as `validate_webhook_url`: this
+    proves the hostname resolved somewhere safe AT THIS MOMENT, not
+    that it always will (DNS rebinding). Unlike the webhook case, an
+    on-demand crawl fires the real request immediately after this
+    check (no minutes-to-months gap between validation and use), which
+    substantially shrinks the rebinding window rather than eliminating
+    it.
+
+    `resolver` is injectable for tests (avoid real DNS lookups) --
+    production callers should omit it and get the real
+    `socket.getaddrinfo`-backed resolution.
+    """
+    _reject_non_bare_domain(domain)
+    hostname = domain
+
+    resolve = resolver or _default_resolve
+    try:
+        addresses = resolve(hostname)
+    except socket.gaierror as exc:
+        raise UnsafeCrawlDomainError(f"domain '{hostname}' could not be resolved") from exc
+
+    if not addresses:
+        raise UnsafeCrawlDomainError(f"domain '{hostname}' did not resolve to any address")
+
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if _is_unsafe_ip(ip):
+            raise UnsafeCrawlDomainError(
+                f"domain '{hostname}' resolves to a disallowed address ({address}) -- "
+                "private, loopback, link-local (including the cloud metadata address), multicast, "
+                "reserved, and unspecified addresses are not permitted"
+            )
+
+
+__all__ = [
+    "UnsafeCrawlDomainError",
+    "UnsafeWebhookURLError",
+    "validate_crawl_domain",
+    "validate_webhook_url",
+]

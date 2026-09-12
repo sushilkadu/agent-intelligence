@@ -117,6 +117,11 @@ services:
       RAW_DATA_BUCKET_NAME: agent-intel-raw-crawl-dev
       EXPORT_BUCKET_NAME: agent-intel-exports-dev
       RATE_LIMIT_TABLE_NAME: agent-intel-dev-rate-limit
+      # On-demand crawl triggering (GET /v1/domains/{domain} cache
+      # miss -- see api/routes.py's _trigger_on_demand_crawl): the SAME
+      # crawl-queue crawler-service already consumes from and
+      # scheduler-service already publishes to.
+      CRAWL_QUEUE_URL: http://localstack:4566/000000000000/crawl-queue
     ports:
       - "8000:8000"
     healthcheck:

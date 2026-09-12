@@ -114,6 +114,38 @@ BULK_ALLOWED_PLAN_TIERS = ("self_serve", "licensing")
 # BULK_ALLOWED_PLAN_TIERS.
 MONITOR_ALLOWED_PLAN_TIERS = BULK_ALLOWED_PLAN_TIERS
 
+# --- On-demand crawl triggering (cache-miss path) ---------------------------
+#
+# `GET /v1/domains/{domain}` used to return a clean 404 on a cache
+# miss. It now triggers a real crawl instead -- see
+# `api/crawl_trigger.py` and `api/routes.py`'s `_trigger_on_demand_crawl`.
+#
+# api-service had no SQS send access before this feature (it only ever
+# read Postgres/S3/DynamoDB) -- CRAWL_QUEUE_URL is new, mirroring
+# scheduler-service's own `CRAWL_QUEUE_URL` env var (same queue, same
+# message shape, see scheduler/messaging.py) so this becomes a second/
+# third producer onto the SAME queue crawler-service already consumes,
+# not a new pipeline entry point.
+CRAWL_QUEUE_URL = os.environ.get("CRAWL_QUEUE_URL", "")
+
+# How long one domain's "a crawl is already in flight" marker lives in
+# the rate-limit DynamoDB table (see `api/crawl_trigger.py`'s
+# `try_acquire_crawl_lock`) before a subsequent lookup is allowed to
+# trigger another crawl for the same domain. Long enough to comfortably
+# cover a realistic crawl+parse round trip (crawler-service's three
+# well-known-path fetches now run in parallel -- see
+# services/crawler-service/crawler/fetch.py -- so worst case is roughly
+# one fetch timeout, plus S3 writes, SQS hops, and parser-service's own
+# upsert), short enough that a genuinely stuck/failed crawl doesn't
+# block a domain from ever being retried.
+PENDING_CRAWL_TTL_SECONDS = int(os.environ.get("PENDING_CRAWL_TTL_SECONDS", "45"))
+
+# Suggested poll interval (seconds) returned to the caller in the 202
+# "crawl triggered" response body -- purely advisory (this service
+# doesn't enforce it), consumed by the frontend's polling loop (see
+# apps/frontend/app/page.tsx).
+CRAWL_POLL_INTERVAL_SECONDS = int(os.environ.get("CRAWL_POLL_INTERVAL_SECONDS", "2"))
+
 # --- Licensing-only bulk export (Phase 5) -----------------------------------
 #
 # Only `licensing`-tier keys may dump the full `domains` table --
@@ -141,6 +173,8 @@ __all__ = [
     "AWS_REGION",
     "BULK_ALLOWED_PLAN_TIERS",
     "BULK_MAX_DOMAINS",
+    "CRAWL_POLL_INTERVAL_SECONDS",
+    "CRAWL_QUEUE_URL",
     "DB_HOST",
     "DB_NAME",
     "DB_PASSWORD",
@@ -154,6 +188,7 @@ __all__ = [
     "HISTORY_MAX_LIMIT",
     "HISTORY_S3_LIST_CAP",
     "MONITOR_ALLOWED_PLAN_TIERS",
+    "PENDING_CRAWL_TTL_SECONDS",
     "RATE_LIMIT_PER_MINUTE",
     "RATE_LIMIT_TABLE_NAME",
     "RATE_LIMIT_WINDOW_SECONDS",

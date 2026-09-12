@@ -10,6 +10,7 @@ never raise.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -141,15 +142,33 @@ async def crawl_domain(domain: str, client: httpx.AsyncClient | None = None) -> 
     Pass an existing `client` to reuse connection pooling across many
     domains in one crawl batch (the Lambda handler does this); omit it
     for one-off/manual use, which opens and closes a client for you.
+
+    The (up to) three well-known-path fetches run CONCURRENTLY via
+    `asyncio.gather`, not one after another. This was a background/batch
+    crawling function, where three sequential `await`s were fine; it's
+    now also on the critical path of a real user waiting on
+    `GET /v1/domains/{domain}` to trigger an on-demand crawl (see
+    services/api-service/api/routes.py's `_trigger_on_demand_crawl`),
+    where worst-case latency mattered: sequential awaits meant a
+    slow/unresponsive domain could cost up to ~3x `DEFAULT_TIMEOUT_SECONDS`
+    (one timeout per signal); running them concurrently bounds the
+    worst case to roughly ONE timeout period instead. Purely a
+    concurrency change -- every fetch's own result/status-code/error
+    semantics are untouched.
     """
     async def _run(active_client: httpx.AsyncClient) -> CrawlResult:
-        agents_json = await fetch_agents_json(active_client, domain)
-        web_bot_auth = await fetch_web_bot_auth_directory(active_client, domain)
-        llms_txt = (
-            await fetch_llms_txt(active_client, domain)
-            if CRAWL_LLMS_TXT_ENABLED
-            else _not_fetched_result(build_url(domain, LLMS_TXT_PATH))
-        )
+        if CRAWL_LLMS_TXT_ENABLED:
+            agents_json, web_bot_auth, llms_txt = await asyncio.gather(
+                fetch_agents_json(active_client, domain),
+                fetch_web_bot_auth_directory(active_client, domain),
+                fetch_llms_txt(active_client, domain),
+            )
+        else:
+            agents_json, web_bot_auth = await asyncio.gather(
+                fetch_agents_json(active_client, domain),
+                fetch_web_bot_auth_directory(active_client, domain),
+            )
+            llms_txt = _not_fetched_result(build_url(domain, LLMS_TXT_PATH))
         return CrawlResult(
             domain=domain,
             agents_json=agents_json,

@@ -1,13 +1,48 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, ReactNode, useState } from "react";
+import { FormEvent, ReactNode, useEffect, useState } from "react";
 
 // Configurable so this same build can point at a deployed api-service
 // (Phase 3's HTTP API) instead of a local one -- defaults to
 // api-service's local `uvicorn` server for local dev (see
 // services/api-service/app.py).
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+
+// GET /v1/domains/{domain}'s cache-miss path now triggers a real
+// on-demand crawl (202 "pending") instead of a dead-end 404 -- see
+// services/api-service/api/routes.py's `_trigger_on_demand_crawl`.
+// This page polls the SAME endpoint until the record lands (or a
+// bounded timeout passes) instead of asking the visitor to retry
+// manually.
+//
+// POLL_INTERVAL_MS mirrors api-service's own `retry_after_seconds`
+// default (see api/config.py's `CRAWL_POLL_INTERVAL_SECONDS`) -- kept
+// as a plain constant here rather than reading the value out of the
+// 202 body, since polling faster than ~2s buys nothing (a crawl+parse
+// round trip never completes that quickly) and this page has no way
+// to poll SLOWER without also slowing down the very first check.
+// POLL_TIMEOUT_MS budgets for crawler-service's now-parallelized fetch
+// (worst case roughly one fetch timeout, see
+// services/crawler-service/crawler/fetch.py's `crawl_domain`
+// docstring) plus the S3 write -> SQS -> parser-service upsert round
+// trip, with comfortable headroom.
+const POLL_INTERVAL_MS = 2000;
+const POLL_TIMEOUT_MS = 40000;
+
+// Purely cosmetic, honest engagement while polling: real progress
+// through the crawl isn't observable from here (the API only ever
+// reports "still pending" vs. "found," never which specific signal
+// finished first -- see the docstring on the `pending` state below),
+// so this cycles on a fixed timer rather than claiming to track real
+// sub-progress.
+const CRAWL_STAGE_MESSAGES = [
+  "Checking agents.json…",
+  "Checking the Web Bot Auth directory…",
+  "Checking llms.txt…",
+  "Some sites take a little longer to answer…",
+];
+const STAGE_MESSAGE_INTERVAL_MS = 2500;
 
 // Mirrors packages/shared-schema/shared_schema/models.py's `Domain`
 // (api-service's `GET /v1/domains/{domain}` returns this shape
@@ -34,8 +69,10 @@ interface ApiErrorBody {
 type LookupState =
   | { status: "idle" }
   | { status: "loading" }
+  | { status: "pending"; domain: string; pollToken: number }
   | { status: "found"; record: DomainRecord }
-  | { status: "not_found"; domain: string }
+  | { status: "unsafe_domain"; domain: string; message: string }
+  | { status: "timed_out"; domain: string }
   | { status: "rate_limited"; message: string }
   | { status: "error"; message: string };
 
@@ -66,6 +103,8 @@ function formatTimestamp(iso: string): string {
   }
 }
 
+let pollTokenCounter = 0;
+
 export default function Home() {
   const [domainInput, setDomainInput] = useState("");
   const [state, setState] = useState<LookupState>({ status: "idle" });
@@ -76,39 +115,59 @@ export default function Home() {
     if (!domain) return;
 
     setState({ status: "loading" });
-    try {
-      const response = await fetch(`${API_BASE_URL}/v1/domains/${encodeURIComponent(domain)}`);
-
-      if (response.status === 404) {
-        setState({ status: "not_found", domain });
-        return;
-      }
-      if (response.status === 429) {
-        const body: ApiErrorBody = await response.json().catch(() => ({}));
-        setState({
-          status: "rate_limited",
-          message: body.message ?? "Too many requests -- please slow down and try again shortly.",
-        });
-        return;
-      }
-      if (!response.ok) {
-        const body: ApiErrorBody = await response.json().catch(() => ({}));
-        setState({
-          status: "error",
-          message: body.message ?? `Something went wrong (HTTP ${response.status}).`,
-        });
-        return;
-      }
-
-      const record = (await response.json()) as DomainRecord;
-      setState({ status: "found", record });
-    } catch {
-      setState({
-        status: "error",
-        message: "Couldn't reach the Agent Intelligence API. Is it running?",
-      });
-    }
+    const outcome = await fetchDomainOutcome(domain);
+    setState(
+      outcome.kind === "pending" ? { status: "pending", domain, pollToken: ++pollTokenCounter } : outcome.state,
+    );
   }
+
+  // Keyed off `pollToken` (assigned once, above, the moment a lookup
+  // FIRST comes back 202), extracted to a plain variable so the
+  // dependency array below is a single identifier ESLint can check
+  // statically, not an inline expression.
+  const pendingPollToken = state.status === "pending" ? state.pollToken : null;
+
+  // Drives the polling loop while `state.status === "pending"`. Reruns
+  // only when `pendingPollToken` changes (a NEW pending episode, i.e.
+  // a fresh manual submit) -- NOT on every `state` change, since a
+  // still-pending poll deliberately does NOT call `setState` at all
+  // (see `poll` below), so this effect's one-time `deadline`
+  // computation isn't repeatedly reset by its own polling and
+  // `POLL_TIMEOUT_MS` means what it says. `state` itself is read only
+  // to capture `domain` at effect-start time, not reacted to.
+  useEffect(() => {
+    if (state.status !== "pending") return;
+    const { domain } = state;
+
+    let cancelled = false;
+    let timer: number;
+    const deadline = Date.now() + POLL_TIMEOUT_MS;
+
+    async function poll() {
+      if (cancelled) return;
+      if (Date.now() >= deadline) {
+        setState({ status: "timed_out", domain });
+        return;
+      }
+
+      const outcome = await fetchDomainOutcome(domain);
+      if (cancelled) return;
+
+      if (outcome.kind === "pending") {
+        timer = window.setTimeout(poll, POLL_INTERVAL_MS);
+      } else {
+        setState(outcome.state);
+      }
+    }
+
+    timer = window.setTimeout(poll, POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally keyed on pendingPollToken only, see comment above
+  }, [pendingPollToken]);
 
   return (
     <div className="flex min-h-screen flex-col items-center bg-zinc-50 px-4 py-16 font-sans dark:bg-black sm:py-24">
@@ -137,10 +196,12 @@ export default function Home() {
           />
           <button
             type="submit"
-            disabled={state.status === "loading" || domainInput.trim().length === 0}
+            disabled={
+              (state.status === "loading" || state.status === "pending") || domainInput.trim().length === 0
+            }
             className="shrink-0 rounded-lg bg-black px-4 py-2.5 text-sm font-medium text-white transition-opacity disabled:opacity-40 dark:bg-zinc-50 dark:text-black"
           >
-            {state.status === "loading" ? "Checking…" : "Check domain"}
+            {state.status === "loading" || state.status === "pending" ? "Checking…" : "Check domain"}
           </button>
         </form>
 
@@ -157,6 +218,63 @@ export default function Home() {
   );
 }
 
+// Either "still pending, nothing to show yet" (the caller decides what
+// that means -- an initial submit turns it into the `pending` state; a
+// poll iteration that's already in the `pending` state just tries
+// again without touching React state at all) or a final, settled
+// `LookupState` to render.
+type LookupOutcome = { kind: "pending" } | { kind: "settled"; state: LookupState };
+
+/**
+ * One GET /v1/domains/{domain} call, translated into a `LookupOutcome`.
+ * Deliberately does not call `setState` itself -- both call sites
+ * (the initial submit in `handleSubmit` and each iteration of the
+ * polling loop in `Home`'s effect) need to react to a "still pending"
+ * result differently, so the decision of what that means for React
+ * state stays with them.
+ */
+async function fetchDomainOutcome(domain: string): Promise<LookupOutcome> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/v1/domains/${encodeURIComponent(domain)}`);
+
+    if (response.status === 202) {
+      return { kind: "pending" };
+    }
+    if (response.status === 400) {
+      const body: ApiErrorBody = await response.json().catch(() => ({}));
+      return {
+        kind: "settled",
+        state: { status: "unsafe_domain", domain, message: body.message ?? `'${domain}' can't be checked.` },
+      };
+    }
+    if (response.status === 429) {
+      const body: ApiErrorBody = await response.json().catch(() => ({}));
+      return {
+        kind: "settled",
+        state: {
+          status: "rate_limited",
+          message: body.message ?? "Too many requests -- please slow down and try again shortly.",
+        },
+      };
+    }
+    if (!response.ok) {
+      const body: ApiErrorBody = await response.json().catch(() => ({}));
+      return {
+        kind: "settled",
+        state: { status: "error", message: body.message ?? `Something went wrong (HTTP ${response.status}).` },
+      };
+    }
+
+    const record = (await response.json()) as DomainRecord;
+    return { kind: "settled", state: { status: "found", record } };
+  } catch {
+    return {
+      kind: "settled",
+      state: { status: "error", message: "Couldn't reach the Agent Intelligence API. Is it running?" },
+    };
+  }
+}
+
 function ResultsPanel({ state }: { state: LookupState }) {
   if (state.status === "idle") {
     return null;
@@ -168,15 +286,25 @@ function ResultsPanel({ state }: { state: LookupState }) {
         <p className="text-zinc-500 dark:text-zinc-400">Looking this domain up…</p>
       )}
 
-      {state.status === "not_found" && (
+      {/* `key` forces a fresh mount (and a reset `stageIndex`) per
+          pending episode, instead of an effect reaching back in to
+          reset state on an existing instance. */}
+      {state.status === "pending" && <PendingCrawl key={state.pollToken} domain={state.domain} />}
+
+      {state.status === "timed_out" && (
         <div className="flex flex-col gap-1">
-          <p className="font-medium text-black dark:text-zinc-50">
-            We haven&apos;t crawled &ldquo;{state.domain}&rdquo; yet.
-          </p>
+          <p className="font-medium text-black dark:text-zinc-50">Taking longer than expected.</p>
           <p className="text-zinc-500 dark:text-zinc-400">
-            This domain isn&apos;t in our index yet -- it hasn&apos;t been crawled, which just means
-            we don&apos;t have data for it right now, not that anything is wrong with it.
+            We&apos;re still crawling &ldquo;{state.domain}&rdquo; -- check back in a moment and
+            search it again.
           </p>
+        </div>
+      )}
+
+      {state.status === "unsafe_domain" && (
+        <div className="flex flex-col gap-1">
+          <p className="font-medium text-black dark:text-zinc-50">Can&apos;t check that domain.</p>
+          <p className="text-zinc-500 dark:text-zinc-400">{state.message}</p>
         </div>
       )}
 
@@ -195,6 +323,45 @@ function ResultsPanel({ state }: { state: LookupState }) {
       )}
 
       {state.status === "found" && <FoundResult record={state.record} />}
+    </div>
+  );
+}
+
+/**
+ * The "crawl in progress" experience: an indeterminate spinner plus a
+ * cycling line of copy naming what's actually being checked. The
+ * cycling is purely a visual-engagement device on a fixed timer, NOT a
+ * claim about real sub-progress -- api-service only ever reports
+ * "still pending" vs. "found" (see api/routes.py's
+ * `_trigger_on_demand_crawl`), never which individual signal has
+ * completed, so this never asserts one has.
+ */
+function PendingCrawl({ domain }: { domain: string }) {
+  const [stageIndex, setStageIndex] = useState(0);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setStageIndex((i) => (i + 1) % CRAWL_STAGE_MESSAGES.length);
+    }, STAGE_MESSAGE_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <span
+          aria-hidden
+          className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-zinc-300 border-t-black dark:border-zinc-700 dark:border-t-zinc-50"
+        />
+        <p className="font-medium text-black dark:text-zinc-50">
+          Crawling &ldquo;{domain}&rdquo; for the first time…
+        </p>
+      </div>
+      <p className="text-zinc-500 dark:text-zinc-400">{CRAWL_STAGE_MESSAGES[stageIndex]}</p>
+      <p className="text-xs text-zinc-400 dark:text-zinc-500">
+        Nobody has searched this domain before, so we&apos;re fetching it live -- this usually takes
+        a few seconds.
+      </p>
     </div>
   );
 }
