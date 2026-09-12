@@ -70,18 +70,44 @@ def test_invalid_json_is_malformed():
     assert result.malformed is True
     assert result.key_id is None
     assert result.valid is False
+    assert "not valid JSON" in result.malformed_reason
 
 
 def test_missing_keys_array_is_malformed():
     result = parse_web_bot_auth(json.dumps({"not_keys": []}).encode("utf-8"), now=NOW)
 
     assert result.malformed is True
+    assert "keys" in result.malformed_reason
+
+
+def test_bare_single_jwk_object_is_malformed_with_the_shopify_reason():
+    # Real testing against Shopify's actual live Web Bot Auth directory
+    # found exactly this: a bare single JWK, no top-level "keys" array
+    # at all (unlike Cloudflare's own documented JWKS example format).
+    # This is the single most important case in this file -- it's a
+    # verified real-world finding, not a hypothetical edge case.
+    bare_jwk = {"kty": "OKP", "crv": "Ed25519", "kid": "some-key", "exp": _ts(NOW + timedelta(days=30))}
+
+    result = parse_web_bot_auth(json.dumps(bare_jwk).encode("utf-8"), now=NOW)
+
+    assert result.malformed is True
+    assert result.key_id is None
+    assert result.valid is False
+    assert "keys" in result.malformed_reason
 
 
 def test_empty_keys_array_is_malformed():
     result = parse_web_bot_auth(json.dumps({"keys": []}).encode("utf-8"), now=NOW)
 
     assert result.malformed is True
+    assert "keys" in result.malformed_reason
+
+
+def test_keys_array_with_no_dict_entries_is_malformed():
+    result = parse_web_bot_auth(json.dumps({"keys": ["not-a-key-object", 42]}).encode("utf-8"), now=NOW)
+
+    assert result.malformed is True
+    assert result.malformed_reason == 'the "keys" array contains no valid key objects'
 
 
 def test_absent_signal_is_not_malformed():
@@ -90,3 +116,4 @@ def test_absent_signal_is_not_malformed():
     assert result.malformed is False
     assert result.valid is False
     assert result.key_id is None
+    assert result.malformed_reason is None

@@ -62,6 +62,8 @@ domains = Table(
     # schemaless, see parser-service's manifest.py docstring on why
     # agents.json isn't validated against any one fixed schema.
     Column("declared_capabilities", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
+    Column("manifest_malformed_reason", String, nullable=True),
+    Column("web_bot_auth_malformed_reason", String, nullable=True),
     # A simple list of short flag strings -- a native Postgres text
     # array is more idiomatic here than JSONB for a flat list.
     Column("confidence_flags", ARRAY(String), nullable=False, server_default=text("'{}'")),

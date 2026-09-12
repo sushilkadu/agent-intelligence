@@ -32,12 +32,22 @@ from datetime import datetime, timezone
 
 @dataclass
 class ParsedWebBotAuth:
-    """Result of validating one Web Bot Auth JWKS directory payload."""
+    """Result of validating one Web Bot Auth JWKS directory payload.
+
+    `malformed_reason` is a short, specific, human-readable diagnostic,
+    always set together with `malformed=True`. This matters more here
+    than almost anywhere else in the codebase: real testing against
+    Shopify's actual deployed directory found it serves a bare JWK
+    object instead of a `{"keys": [...]}` array -- a plain "couldn't be
+    parsed" doesn't tell a site owner THAT specific, actionable fact,
+    but the reason string does.
+    """
 
     key_id: str | None = None
     expiry: datetime | None = None
     valid: bool = False
     malformed: bool = False
+    malformed_reason: str | None = None
 
 
 def _key_sort_value(key: dict) -> float:
@@ -59,20 +69,41 @@ def parse_web_bot_auth(raw_bytes: bytes | None, *, now: datetime | None = None) 
     now = now or datetime.now(timezone.utc)
 
     try:
-        parsed = json.loads(raw_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return ParsedWebBotAuth(malformed=True)
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return ParsedWebBotAuth(malformed=True, malformed_reason="the response body isn't valid UTF-8 text")
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return ParsedWebBotAuth(malformed=True, malformed_reason=f"not valid JSON ({exc.msg})")
 
     if not isinstance(parsed, dict):
-        return ParsedWebBotAuth(malformed=True)
+        return ParsedWebBotAuth(
+            malformed=True,
+            malformed_reason="the top-level value isn't a JSON object (expected a JWKS: {\"keys\": [...]})",
+        )
 
     keys = parsed.get("keys")
     if not isinstance(keys, list) or not keys:
-        return ParsedWebBotAuth(malformed=True)
+        # This is exactly what real testing found Shopify's actual
+        # deployed directory does: a bare single JWK object with no
+        # "keys" wrapper at all, per the current draft's documented
+        # JWKS format -- see the module docstring's Cloudflare-docs
+        # citation. Naming that specific expectation here is far more
+        # actionable than a generic "malformed" for a site owner who
+        # (like Shopify, evidently) shipped a directory missing it.
+        return ParsedWebBotAuth(
+            malformed=True,
+            malformed_reason='missing a non-empty top-level "keys" array (a JWKS is expected, not a bare key object)',
+        )
 
     valid_key_dicts = [k for k in keys if isinstance(k, dict)]
     if not valid_key_dicts:
-        return ParsedWebBotAuth(malformed=True)
+        return ParsedWebBotAuth(
+            malformed=True,
+            malformed_reason='the "keys" array contains no valid key objects',
+        )
 
     chosen = max(valid_key_dicts, key=_key_sort_value)
 

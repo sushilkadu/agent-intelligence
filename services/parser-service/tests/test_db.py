@@ -71,6 +71,8 @@ def _sample_record(domain: str, **overrides) -> dict:
         "web_bot_auth_valid": True,
         "web_bot_auth_expiry": NOW + timedelta(days=30),
         "declared_capabilities": {"agents": [{"name": "demo-bot"}]},
+        "manifest_malformed_reason": None,
+        "web_bot_auth_malformed_reason": None,
         "confidence_flags": [],
         "on_chain_ref": None,
         "created_at": NOW,

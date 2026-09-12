@@ -64,6 +64,11 @@ interface DomainRecord {
   // single ratified agents.json spec, so this is the raw parsed object,
   // not a fixed set of fields this page can type more specifically).
   declared_capabilities: Record<string, unknown>;
+  // Short, specific, human-readable diagnostics -- only set alongside
+  // the corresponding malformed_manifest/malformed_web_bot_auth flag
+  // (see parser/manifest.py's and parser/webbotauth.py's docstrings).
+  manifest_malformed_reason: string | null;
+  web_bot_auth_malformed_reason: string | null;
   confidence_flags: string[];
 }
 
@@ -421,6 +426,7 @@ function FoundResult({ record }: { record: DomainRecord }) {
       <ul className="flex flex-col gap-2">
         <ResultRow ok={agentsJsonOk}>{agentsJsonLine}</ResultRow>
         {agentsJsonOk && <DeclaredCapabilities capabilities={record.declared_capabilities} />}
+        {manifestMalformed && <MalformedReason reason={record.manifest_malformed_reason} />}
         <ResultRow ok={record.llms_txt_present}>
           {record.llms_txt_present ? "llms.txt found." : "No llms.txt found."}
         </ResultRow>
@@ -428,6 +434,7 @@ function FoundResult({ record }: { record: DomainRecord }) {
         {webBotAuthParsed && (
           <WebBotAuthKeyDetails keyId={record.web_bot_auth_key_id} expiry={record.web_bot_auth_expiry} />
         )}
+        {webBotAuthMalformed && <MalformedReason reason={record.web_bot_auth_malformed_reason} />}
       </ul>
 
       {remainingFlags.length > 0 && (
@@ -507,4 +514,17 @@ function WebBotAuthKeyDetails({ keyId, expiry }: { keyId: string | null; expiry:
       <p>Expires: {expiry ? formatTimestamp(expiry) : "no expiry set"}</p>
     </DetailBlock>
   );
+}
+
+// The specific "why" behind a row's generic "couldn't be parsed." --
+// added after a real user pointed out that message alone doesn't tell
+// a site owner what's actually wrong with their own agents.json/Web
+// Bot Auth directory (see parser/manifest.py's and
+// parser/webbotauth.py's `malformed_reason` docstrings for exactly
+// what's captured and why). `reason` should always be set whenever
+// this renders (the caller only renders it alongside the matching
+// malformed flag) -- the fallback is defensive, not expected in
+// practice.
+function MalformedReason({ reason }: { reason: string | null }) {
+  return <DetailBlock>Why: {reason ?? "no further detail available."}</DetailBlock>;
 }

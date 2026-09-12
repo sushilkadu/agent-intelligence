@@ -95,6 +95,8 @@ def build_domain_record(
         "web_bot_auth_valid": webbotauth.valid,
         "web_bot_auth_expiry": webbotauth.expiry,
         "declared_capabilities": manifest.declared_capabilities,
+        "manifest_malformed_reason": manifest.malformed_reason,
+        "web_bot_auth_malformed_reason": webbotauth.malformed_reason,
         "confidence_flags": confidence_flags,
         "on_chain_ref": on_chain_ref,
         "created_at": created_at,

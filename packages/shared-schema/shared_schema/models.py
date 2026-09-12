@@ -47,6 +47,19 @@ class Domain(BaseModel):
     web_bot_auth_expiry: Optional[datetime] = None
 
     declared_capabilities: dict[str, Any] = Field(default_factory=dict)
+
+    # Short, specific, human-readable diagnostics for WHY a signal was
+    # flagged malformed (see parser-service's manifest.py/webbotauth.py
+    # docstrings) -- e.g. "missing a non-empty top-level 'keys' array",
+    # the actual real-world reason Shopify's live Web Bot Auth directory
+    # was found to fail parsing. Only ever set alongside the
+    # corresponding `malformed_manifest`/`malformed_web_bot_auth` flag in
+    # `confidence_flags`; `None` otherwise (including when the signal
+    # was never fetched at all -- that's `no_signals`, a different
+    # concern).
+    manifest_malformed_reason: Optional[str] = None
+    web_bot_auth_malformed_reason: Optional[str] = None
+
     confidence_flags: list[str] = Field(default_factory=list)
 
     on_chain_ref: Optional[str] = None

@@ -47,10 +47,42 @@ from typing import Any
 
 @dataclass
 class ParsedManifest:
-    """Result of validating one `agents.json` payload."""
+    """Result of validating one `agents.json` payload.
+
+    `malformed_reason` is a short, specific, human-readable diagnostic
+    (e.g. "top-level value is a JSON array, not a JSON object") --
+    always set together with `malformed=True`, always `None` otherwise.
+    Added because a bare "couldn't be parsed" told a site owner
+    debugging their own manifest THAT something was wrong but never
+    WHAT -- exactly the gap a real user flagged after this page started
+    showing that generic message. `str | None` (not baked into a fixed
+    enum of reasons) because the specific wording is meant for a human
+    reading the lookup page, not for a machine branching on it -- a
+    consumer that needs to distinguish failure modes programmatically
+    already has `malformed: bool`.
+    """
 
     declared_capabilities: dict[str, Any] = field(default_factory=dict)
     malformed: bool = False
+    malformed_reason: str | None = None
+
+
+def _json_type_name(value: Any) -> str:
+    """A short, human-readable name for a JSON value's type, used only
+    to make the "not an object" `malformed_reason` specific (e.g. "a
+    JSON array" rather than a generic "not an object").
+    """
+    if isinstance(value, list):
+        return "a JSON array"
+    if isinstance(value, str):
+        return "a JSON string"
+    if isinstance(value, bool):
+        return "a JSON boolean"
+    if isinstance(value, (int, float)):
+        return "a JSON number"
+    if value is None:
+        return "JSON null"
+    return "not a JSON object"  # pragma: no cover -- json.loads can't produce anything else
 
 
 def parse_agents_json(raw_bytes: bytes | None) -> ParsedManifest:
@@ -65,11 +97,16 @@ def parse_agents_json(raw_bytes: bytes | None) -> ParsedManifest:
     try:
         text = raw_bytes.decode("utf-8")
         parsed = json.loads(text)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return ParsedManifest(malformed=True)
+    except UnicodeDecodeError:
+        return ParsedManifest(malformed=True, malformed_reason="the response body isn't valid UTF-8 text")
+    except json.JSONDecodeError as exc:
+        return ParsedManifest(malformed=True, malformed_reason=f"not valid JSON ({exc.msg})")
 
     if not isinstance(parsed, dict):
-        return ParsedManifest(malformed=True)
+        return ParsedManifest(
+            malformed=True,
+            malformed_reason=f"the top-level value is {_json_type_name(parsed)}, not a JSON object",
+        )
 
     return ParsedManifest(declared_capabilities=parsed, malformed=False)
 

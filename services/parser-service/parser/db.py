@@ -49,6 +49,8 @@ _DOMAIN_COLUMNS = (
     "web_bot_auth_valid",
     "web_bot_auth_expiry",
     "declared_capabilities",
+    "manifest_malformed_reason",
+    "web_bot_auth_malformed_reason",
     "confidence_flags",
     "on_chain_ref",
     "created_at",
