@@ -9,6 +9,19 @@ import { FormEvent, ReactNode, useEffect, useState } from "react";
 // services/api-service/app.py).
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
+// Mirror crawler-service's well-known paths (crawler/config.py) so
+// this page can link a visitor straight to the LIVE file on the
+// domain being looked up -- not a copy of what we crawled (that would
+// need a new backend endpoint to serve our stored S3 snapshot), but
+// the current, real thing, which is also what someone would want if
+// they're about to go report a problem to the site owner. Narrow,
+// known coupling: if crawler-service's well-known path constants ever
+// change (the Web Bot Auth draft is still in flux, see that module's
+// own docstring), these three need updating to match.
+const AGENTS_JSON_PATH = "/agents.json";
+const LLMS_TXT_PATH = "/llms.txt";
+const WEB_BOT_AUTH_WELL_KNOWN_PATH = "/.well-known/http-message-signatures-directory";
+
 // GET /v1/domains/{domain}'s cache-miss path now triggers a real
 // on-demand crawl (202 "pending") instead of a dead-end 404 -- see
 // services/api-service/api/routes.py's `_trigger_on_demand_crawl`.
@@ -424,13 +437,24 @@ function FoundResult({ record }: { record: DomainRecord }) {
       </p>
 
       <ul className="flex flex-col gap-2">
-        <ResultRow ok={agentsJsonOk}>{agentsJsonLine}</ResultRow>
+        <ResultRow ok={agentsJsonOk}>
+          {agentsJsonLine}
+          {record.agent_json_present && (
+            <ExternalFileLink href={`https://${record.domain}${AGENTS_JSON_PATH}`} />
+          )}
+        </ResultRow>
         {agentsJsonOk && <DeclaredCapabilities capabilities={record.declared_capabilities} />}
         {manifestMalformed && <MalformedReason reason={record.manifest_malformed_reason} />}
         <ResultRow ok={record.llms_txt_present}>
           {record.llms_txt_present ? "llms.txt found." : "No llms.txt found."}
+          {record.llms_txt_present && <ExternalFileLink href={`https://${record.domain}${LLMS_TXT_PATH}`} />}
         </ResultRow>
-        <ResultRow ok={webBotAuthOk}>{webBotAuthLine}</ResultRow>
+        <ResultRow ok={webBotAuthOk}>
+          {webBotAuthLine}
+          {record.web_bot_auth_present && (
+            <ExternalFileLink href={`https://${record.domain}${WEB_BOT_AUTH_WELL_KNOWN_PATH}`} />
+          )}
+        </ResultRow>
         {webBotAuthParsed && (
           <WebBotAuthKeyDetails keyId={record.web_bot_auth_key_id} expiry={record.web_bot_auth_expiry} />
         )}
@@ -466,6 +490,26 @@ function ResultRow({ ok, children }: { ok: boolean; children: ReactNode }) {
       </span>
       <span className="text-zinc-700 dark:text-zinc-300">{children}</span>
     </li>
+  );
+}
+
+// Opens the actual live file on the domain being looked up, in a new
+// tab -- `noopener` since this is a link to a third-party site we
+// don't control, `noreferrer` so that site doesn't learn it was
+// reached from a lookup of itself. Only ever rendered when the
+// corresponding signal was `present` (see FoundResult) -- present-but-
+// malformed still gets a link, since that's exactly the case where a
+// visitor most wants to go look at the real thing themselves.
+function ExternalFileLink({ href }: { href: string }) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="ml-1 whitespace-nowrap text-zinc-400 underline underline-offset-2 hover:text-zinc-600 dark:text-zinc-500 dark:hover:text-zinc-300"
+    >
+      View live →
+    </a>
   );
 }
 
