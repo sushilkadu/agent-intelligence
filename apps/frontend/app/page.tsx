@@ -56,8 +56,14 @@ interface DomainRecord {
   agent_json_present: boolean;
   llms_txt_present: boolean;
   web_bot_auth_present: boolean;
+  web_bot_auth_key_id: string | null;
   web_bot_auth_valid: boolean;
   web_bot_auth_expiry: string | null;
+  // Whatever the site's agents.json actually declared, stored as-is by
+  // parser-service (see parser/manifest.py's docstring: there's no
+  // single ratified agents.json spec, so this is the raw parsed object,
+  // not a fixed set of fields this page can type more specifically).
+  declared_capabilities: Record<string, unknown>;
   confidence_flags: string[];
 }
 
@@ -400,6 +406,12 @@ function FoundResult({ record }: { record: DomainRecord }) {
 
   const remainingFlags = record.confidence_flags.filter((flag) => !FLAGS_SHOWN_INLINE_IN_A_ROW.has(flag));
 
+  // Parsed successfully (not malformed) is the bar for showing key
+  // details -- an EXPIRED key still has a real kid/expiry worth
+  // showing (that's exactly what tells a site owner "yep, rotate this
+  // one"); a key that couldn't be parsed at all has neither to show.
+  const webBotAuthParsed = record.web_bot_auth_present && !webBotAuthMalformed;
+
   return (
     <div className="flex flex-col gap-4">
       <p className="font-medium text-black dark:text-zinc-50">
@@ -408,10 +420,14 @@ function FoundResult({ record }: { record: DomainRecord }) {
 
       <ul className="flex flex-col gap-2">
         <ResultRow ok={agentsJsonOk}>{agentsJsonLine}</ResultRow>
+        {agentsJsonOk && <DeclaredCapabilities capabilities={record.declared_capabilities} />}
         <ResultRow ok={record.llms_txt_present}>
           {record.llms_txt_present ? "llms.txt found." : "No llms.txt found."}
         </ResultRow>
         <ResultRow ok={webBotAuthOk}>{webBotAuthLine}</ResultRow>
+        {webBotAuthParsed && (
+          <WebBotAuthKeyDetails keyId={record.web_bot_auth_key_id} expiry={record.web_bot_auth_expiry} />
+        )}
       </ul>
 
       {remainingFlags.length > 0 && (
@@ -443,5 +459,52 @@ function ResultRow({ ok, children }: { ok: boolean; children: ReactNode }) {
       </span>
       <span className="text-zinc-700 dark:text-zinc-300">{children}</span>
     </li>
+  );
+}
+
+// Indented to line up under a ResultRow's text (not its icon) --
+// `pl-6` matches that row's icon width (w-4) plus its gap-2, so this
+// reads as "detail of the row above" rather than a new, unrelated line.
+function DetailBlock({ children }: { children: ReactNode }) {
+  return <li className="list-none pl-6 text-xs text-zinc-500 dark:text-zinc-400">{children}</li>;
+}
+
+// `agents.json` has no fixed schema (see parser/manifest.py's
+// docstring -- there's no single ratified spec, so parser-service
+// stores whatever object a site published, as-is). Rather than pretend
+// to understand specific fields this page can't know about in
+// advance, show the raw declared object -- a technical visitor
+// (exactly who's likely to search a domain here) can read arbitrary
+// JSON just fine, and this is strictly more informative than the
+// previous "found." with nothing else to show.
+function DeclaredCapabilities({ capabilities }: { capabilities: Record<string, unknown> }) {
+  const hasFields = Object.keys(capabilities).length > 0;
+  return (
+    <DetailBlock>
+      {hasFields ? (
+        <>
+          <p className="mb-1">Declared capabilities:</p>
+          <pre className="max-h-48 overflow-auto rounded-md bg-zinc-100 p-2 font-mono text-[11px] leading-snug text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+            {JSON.stringify(capabilities, null, 2)}
+          </pre>
+        </>
+      ) : (
+        <p>agents.json was valid JSON but declared no fields.</p>
+      )}
+    </DetailBlock>
+  );
+}
+
+// Shown whenever the Web Bot Auth directory parsed successfully --
+// including an EXPIRED key, since the kid/expiry are exactly what
+// tells a site owner debugging their own setup which key to rotate.
+function WebBotAuthKeyDetails({ keyId, expiry }: { keyId: string | null; expiry: string | null }) {
+  return (
+    <DetailBlock>
+      <p>
+        Key ID: <span className="font-mono">{keyId ?? "(none)"}</span>
+      </p>
+      <p>Expires: {expiry ? formatTimestamp(expiry) : "no expiry set"}</p>
+    </DetailBlock>
   );
 }
