@@ -27,8 +27,26 @@ def test_neither_signal_present_is_no_signals_only():
         web_bot_auth_present=False,
         web_bot_auth_malformed=False,
         web_bot_auth_valid=False,
+        llms_txt_present=False,
     )
     assert flags == [NO_SIGNALS]
+
+
+def test_llms_txt_present_alone_is_not_no_signals():
+    """Regression test: llms.txt was added to the crawler/schema in
+    Phase 5 but never threaded through this function, so a domain with
+    ONLY llms.txt present (e.g. github.com in real local testing) was
+    incorrectly flagged `no_signals`.
+    """
+    flags = compute_confidence_flags(
+        agents_json_present=False,
+        manifest_malformed=False,
+        web_bot_auth_present=False,
+        web_bot_auth_malformed=False,
+        web_bot_auth_valid=False,
+        llms_txt_present=True,
+    )
+    assert flags == []
 
 
 def test_malformed_manifest_present():

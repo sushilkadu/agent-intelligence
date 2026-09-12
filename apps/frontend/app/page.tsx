@@ -19,6 +19,7 @@ interface DomainRecord {
   first_seen_at: string;
   last_crawled_at: string;
   agent_json_present: boolean;
+  llms_txt_present: boolean;
   web_bot_auth_present: boolean;
   web_bot_auth_valid: boolean;
   web_bot_auth_expiry: string | null;
@@ -117,8 +118,8 @@ export default function Home() {
             Agent Intelligence
           </h1>
           <p className="max-w-sm text-sm text-zinc-500 dark:text-zinc-400">
-            Check any domain&apos;s agent-readiness: whether it publishes agents.json or a Web Bot
-            Auth directory for AI agents to discover.
+            Check any domain&apos;s agent-readiness: whether it publishes agents.json, llms.txt, or
+            a Web Bot Auth directory for AI agents to discover.
           </p>
         </div>
 
@@ -214,6 +215,9 @@ function FoundResult({ record }: { record: DomainRecord }) {
       <ul className="flex flex-col gap-2">
         <ResultRow ok={record.agent_json_present}>
           {record.agent_json_present ? "agents.json found." : "No agents.json found."}
+        </ResultRow>
+        <ResultRow ok={record.llms_txt_present}>
+          {record.llms_txt_present ? "llms.txt found." : "No llms.txt found."}
         </ResultRow>
         <ResultRow ok={record.web_bot_auth_present && record.web_bot_auth_valid}>
           {webBotAuthLine}

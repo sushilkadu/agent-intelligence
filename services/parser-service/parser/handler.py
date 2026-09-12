@@ -126,6 +126,7 @@ def process_message(
         web_bot_auth_present=web_bot_auth_present,
         web_bot_auth_malformed=webbotauth.malformed,
         web_bot_auth_valid=webbotauth.valid,
+        llms_txt_present=llms_txt_present,
     )
 
     previous = fetch_domain(conn, domain)

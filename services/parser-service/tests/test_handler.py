@@ -373,6 +373,12 @@ def test_llms_txt_and_on_chain_ref_passed_through_from_raw_fetched_message(monke
     assert record["llms_txt_present"] is True
     assert record["llms_txt_s3_key"] == "withllms.example/2026-09-09T12:00:00+00:00/llms.txt"
     assert record["on_chain_ref"] == "chain:stub:not-a-real-lookup"
+    # Regression check: agents.json/web_bot_auth are both absent here,
+    # but llms.txt IS present -- `no_signals` must not fire (this was a
+    # real bug: llms_txt_present wasn't threaded through
+    # compute_confidence_flags, so a domain with only llms.txt was
+    # incorrectly flagged no_signals; see test_confidence.py).
+    assert "no_signals" not in record["confidence_flags"]
 
 
 def test_extract_message_from_valid_body():

@@ -20,13 +20,23 @@ def compute_confidence_flags(
     web_bot_auth_present: bool,
     web_bot_auth_malformed: bool,
     web_bot_auth_valid: bool,
+    llms_txt_present: bool = False,
 ) -> list[str]:
     """Compute the `confidence_flags` list for one crawl.
 
-    - `no_signals`: neither signal was present at all. Deliberately
-      does NOT also set malformed_manifest/malformed_web_bot_auth for a
-      signal that was never fetched -- those only apply when a signal
-      *was* present but couldn't be parsed.
+    - `no_signals`: NONE of the three crawled signals (agents.json,
+      the Web Bot Auth directory, llms.txt) were present. `llms_txt_present`
+      defaults to `False` so old call sites (and any pre-Phase-5
+      `raw-fetched` message that never carried an `llms_txt` field)
+      keep working, but it is a real signal and MUST be included here
+      -- a domain that only publishes llms.txt is not signal-less. This
+      was a real bug: llms.txt was added to the crawler/schema in Phase
+      5 but never threaded through this function, so a domain like
+      github.com (llms.txt present, nothing else) was incorrectly
+      flagged `no_signals`. Deliberately does NOT set
+      malformed_manifest/malformed_web_bot_auth for a signal that was
+      never fetched -- those only apply when a signal *was* present
+      but couldn't be parsed.
     - `malformed_manifest`: agents.json was present but wasn't a valid
       JSON object (see manifest.py's lenient-validation rationale).
     - `malformed_web_bot_auth`: the Web Bot Auth JWKS directory was
@@ -45,7 +55,7 @@ def compute_confidence_flags(
     """
     flags: list[str] = []
 
-    if not agents_json_present and not web_bot_auth_present:
+    if not agents_json_present and not web_bot_auth_present and not llms_txt_present:
         flags.append(NO_SIGNALS)
         return flags
 
