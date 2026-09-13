@@ -22,6 +22,35 @@ const AGENTS_JSON_PATH = "/agents.json";
 const LLMS_TXT_PATH = "/llms.txt";
 const WEB_BOT_AUTH_WELL_KNOWN_PATH = "/.well-known/http-message-signatures-directory";
 
+// Shown when a signal is ABSENT -- what it means for this site not to
+// publish it, and where to go actually implement it. Each `href` was
+// hand-checked (not guessed) before shipping:
+//   - agents.json: there is genuinely no single ratified spec (see
+//     parser/manifest.py's docstring) -- wildcard-ai/agents-json is one
+//     concrete, implementable proposal, not "the" standard, and the
+//     copy below says so rather than overclaiming.
+//   - llms.txt: llmstxt.org is the actual canonical spec/explainer
+//     (Jeremy Howard / Answer.AI), confirmed current as of this
+//     writing.
+//   - Web Bot Auth: Cloudflare's own developer docs (Cloudflare
+//     co-authored the underlying IETF draft) -- chosen over the raw
+//     IETF draft text as the more actionable "how do I actually set
+//     this up" page for a site owner, not just the spec.
+const ABSENT_SIGNAL_INFO = {
+  agentsJson: {
+    text: "Without a published manifest, AI agents can't discover this site's API endpoints or capabilities in a structured way -- they may have to guess, fall back to scraping the page, or skip the site entirely. There's no single agreed standard yet; several competing proposals exist.",
+    href: "https://github.com/wild-card-ai/agents-json",
+  },
+  llmsTxt: {
+    text: "Without an llms.txt file, AI assistants summarizing or answering questions about this site have to parse full pages instead of a concise, curated summary -- which can mean slower or less accurate answers about this site's content.",
+    href: "https://llmstxt.org",
+  },
+  webBotAuth: {
+    text: "Without this, the site has no cryptographic way to verify that a bot claiming to be a legitimate AI agent actually is one. Well-behaved agents may get blocked, rate-limited, or challenged by bot-management systems that can't confirm their identity.",
+    href: "https://developers.cloudflare.com/bots/reference/bot-verification/web-bot-auth",
+  },
+} as const;
+
 // GET /v1/domains/{domain}'s cache-miss path now triggers a real
 // on-demand crawl (202 "pending") instead of a dead-end 404 -- see
 // services/api-service/api/routes.py's `_trigger_on_demand_crawl`.
@@ -445,10 +474,12 @@ function FoundResult({ record }: { record: DomainRecord }) {
         </ResultRow>
         {agentsJsonOk && <DeclaredCapabilities capabilities={record.declared_capabilities} />}
         {manifestMalformed && <MalformedReason reason={record.manifest_malformed_reason} />}
+        {!record.agent_json_present && <AbsentSignalNote {...ABSENT_SIGNAL_INFO.agentsJson} />}
         <ResultRow ok={record.llms_txt_present}>
           {record.llms_txt_present ? "llms.txt found." : "No llms.txt found."}
           {record.llms_txt_present && <ExternalFileLink href={`https://${record.domain}${LLMS_TXT_PATH}`} />}
         </ResultRow>
+        {!record.llms_txt_present && <AbsentSignalNote {...ABSENT_SIGNAL_INFO.llmsTxt} />}
         <ResultRow ok={webBotAuthOk}>
           {webBotAuthLine}
           {record.web_bot_auth_present && (
@@ -458,6 +489,7 @@ function FoundResult({ record }: { record: DomainRecord }) {
         {webBotAuthParsed && (
           <WebBotAuthKeyDetails keyId={record.web_bot_auth_key_id} expiry={record.web_bot_auth_expiry} />
         )}
+        {!record.web_bot_auth_present && <AbsentSignalNote {...ABSENT_SIGNAL_INFO.webBotAuth} />}
         {webBotAuthMalformed && <MalformedReason reason={record.web_bot_auth_malformed_reason} />}
       </ul>
 
@@ -493,23 +525,48 @@ function ResultRow({ ok, children }: { ok: boolean; children: ReactNode }) {
   );
 }
 
-// Opens the actual live file on the domain being looked up, in a new
-// tab -- `noopener` since this is a link to a third-party site we
-// don't control, `noreferrer` so that site doesn't learn it was
-// reached from a lookup of itself. Only ever rendered when the
-// corresponding signal was `present` (see FoundResult) -- present-but-
-// malformed still gets a link, since that's exactly the case where a
-// visitor most wants to go look at the real thing themselves.
-function ExternalFileLink({ href }: { href: string }) {
+// Shared style for both `ExternalFileLink` ("View live") and
+// `AbsentSignalNote`'s "Learn more" -- one small, muted, external-link
+// look for every third-party link on this page. `noopener` since these
+// all point at sites we don't control; `noreferrer` so that site
+// doesn't learn it was reached from a lookup of itself.
+function SmallExternalLink({ href, label }: { href: string; label: string }) {
   return (
     <a
       href={href}
       target="_blank"
       rel="noopener noreferrer"
-      className="ml-1 whitespace-nowrap text-zinc-400 underline underline-offset-2 hover:text-zinc-600 dark:text-zinc-500 dark:hover:text-zinc-300"
+      className="whitespace-nowrap text-zinc-400 underline underline-offset-2 hover:text-zinc-600 dark:text-zinc-500 dark:hover:text-zinc-300"
     >
-      View live →
+      {label}
     </a>
+  );
+}
+
+// Opens the actual live file on the domain being looked up. Only ever
+// rendered when the corresponding signal was `present` (see
+// FoundResult) -- present-but-malformed still gets a link, since
+// that's exactly the case where a visitor most wants to go look at the
+// real thing themselves.
+function ExternalFileLink({ href }: { href: string }) {
+  return (
+    <span className="ml-1">
+      <SmallExternalLink href={href} label="View live →" />
+    </span>
+  );
+}
+
+// Shown when a signal is ABSENT: what that means and where to go
+// implement it (see ABSENT_SIGNAL_INFO's docstring for how each `href`
+// was chosen). Pairs with `MalformedReason`/`DeclaredCapabilities` --
+// every row now explains itself, whether the signal is missing,
+// broken, or fine.
+function AbsentSignalNote({ text, href }: { text: string; href: string }) {
+  return (
+    <DetailBlock>
+      <p className="mb-1">{text}</p>
+      <SmallExternalLink href={href} label="Learn more →" />
+    </DetailBlock>
   );
 }
 
